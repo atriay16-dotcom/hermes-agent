@@ -68,7 +68,9 @@ import { recycleOwnedBackend } from './backend-recycle'
 import { isPidAliveWindows, waitForBackendRelease } from './backend-release-gate'
 import {
   isHostKeyChangedBootFailure,
+  isRetryableLocalDeferral,
   isRetryableRemoteBootFailure,
+  isTransientDeferralFailure,
   shouldLatchBackendStartFailure,
   shouldLatchHostKeyChangedFailure,
   shouldLatchRemoteReauthFailure
@@ -389,7 +391,14 @@ import {
   resolveCommitLogSelection,
   shouldCountCommits
 } from './update-count'
-import { waitForUpdateClearance } from './update-gate'
+import {
+  dispatchUpdatesRemoteFirst,
+  guardedRemoteRowUpdate,
+  localHandoffBlock,
+  pendingManagedRemoteWork,
+  reserveUpdateLifecycle,
+  waitForUpdateClearance
+} from './update-gate'
 import { readLiveUpdateMarker, updateHandoffConflict, writeUpdateMarker } from './update-marker'
 import { isOfficialSshRemote, OFFICIAL_REPO_HTTPS_URL } from './update-remote'
 import {
@@ -3374,6 +3383,16 @@ let updateInFlight = false
 // actually dies and the hand-off script can proceed immediately.
 let isQuittingForHandoff = false
 
+// One home for "the hand-off owns the exit deadline", so every sibling update
+// entry point (managed SSH, fleet URL rows) gets the same answer.
+const localHandoffSignals = {
+  isUpdateInFlight: () => updateInFlight,
+  isQuittingForHandoff: () => isQuittingForHandoff,
+  setUpdateInFlight: (inFlight: boolean) => {
+    updateInFlight = inFlight
+  }
+}
+
 // Quit-guard latches: one while the confirmation is on screen (a second
 // Cmd-Q must not stack dialogs), one after the user has said "quit anyway"
 // (the app.quit() that follows re-enters before-quit and must pass through).
@@ -3946,11 +3965,29 @@ async function releaseBackendLock(updateRoot, tag) {
 // Detection (checkUpdates / commit changelog / "N behind") stays in the UI;
 // only this apply action changed.
 async function applyUpdates(opts: { stopSafeBlockers?: boolean } = {}) {
-  if (updateInFlight) {
-    throw new Error('An update is already in progress.')
+  // Refuse rather than race the detached updater's fixed exit deadline (Sep 1
+  // Windows abort). The two ACTIVE maps are the whole refusal set: they are
+  // exactly what before-quit awaits. See pendingManagedRemoteWork for why an
+  // unresumed durable recovery record deliberately does not block here.
+  const blockedBy = pendingManagedRemoteWork(managedConnectionUpdates.keys(), managedConnectionRecoveries.keys())
+
+  if (blockedBy.length > 0) {
+    const message = `Update refused: a managed SSH update/recovery is still running for ${blockedBy.join(', ')}. Retry once it finishes.`
+    rememberLog(`[updates] refusing local hand-off: ${message}`)
+    emitUpdateProgress({ stage: 'error', message, percent: null })
+
+    return { ok: false, error: 'managed-remote-update-pending', message }
   }
 
-  updateInFlight = true
+  // Reserving covers the post-finally dwell too: applyUpdates clears
+  // updateInFlight in its `finally` while the dwell timer still has app.quit()
+  // scheduled, so an updateInFlight-only guard let a second apply spawn a
+  // second updater into an already-quitting process.
+  const reservation = reserveUpdateLifecycle(localHandoffSignals)
+
+  if (!reservation.ok) {
+    throw new Error('An update is already in progress.')
+  }
 
   try {
     const updater = resolveUpdaterBinary()
@@ -4295,8 +4332,24 @@ async function applyUpdates(opts: { stopSafeBlockers?: boolean } = {}) {
 
     return { ok: true, handedOff: true, updater }
   } finally {
-    updateInFlight = false
+    reservation.release()
   }
+}
+
+// A recovery hand-off that must not start yet. Returning false is NOT the
+// refusal here: it falls through to a full bootstrap install, which would fight
+// the very update we are waiting on. This carries the caller's own
+// bootstrap-failure classification, but is deliberately never latched into
+// `bootstrapFailure` (unlike a committed hand-off), so the next boot retry
+// reopens once that work finishes.
+function deferredRecoveryHandoff(reason, cause) {
+  rememberLog(`[bootstrap] deferring ${reason} recovery hand-off: ${cause}`)
+  const deferred: any = new Error(`Hermes recovery is waiting: ${cause}. It will retry once that finishes.`)
+
+  deferred.isBootstrapFailure = true
+  deferred.isTransientDeferral = true
+
+  return deferred
 }
 
 async function handOffWindowsBootstrapRecovery(reason) {
@@ -4308,6 +4361,17 @@ async function handOffWindowsBootstrapRecovery(reason) {
 
   if (!updater) {
     return false
+  }
+
+  // Same deadline hazard applyUpdates refuses. Returning false is NOT the
+  // refusal here: it falls through to a full bootstrap install, which would
+  // fight the very work we are waiting on. Throw the caller's own
+  // bootstrap-failure classification instead, unlatched (unlike a committed
+  // hand-off) so the boot retry reopens once that work finishes.
+  const blockedBy = pendingManagedRemoteWork(managedConnectionUpdates.keys(), managedConnectionRecoveries.keys())
+
+  if (blockedBy.length > 0) {
+    throw deferredRecoveryHandoff(reason, `a managed SSH update is running (${blockedBy.join(', ')})`)
   }
 
   const handoffConflict = updateHandoffConflict(HERMES_HOME)
@@ -4328,6 +4392,27 @@ async function handOffWindowsBootstrapRecovery(reason) {
     return true
   }
 
+  // Reserve the lifecycle BEFORE the backend lock is released, as applyUpdates
+  // does: through the spawn and dwell observation this window otherwise shows
+  // both flags clear. Reserving is also the reentry check — a local/client
+  // hand-off already owns the exit deadline, and spawning a second updater over
+  // its install is the exact hazard. The release must also run on a throw or
+  // updates stay wedged; on the committed path isQuittingForHandoff has taken
+  // over by then, and a refusal releases nothing.
+  const reservation = reserveUpdateLifecycle(localHandoffSignals)
+
+  if (!reservation.ok) {
+    throw deferredRecoveryHandoff(reason, `a local update hand-off is in progress (${reservation.blockedBy})`)
+  }
+
+  try {
+    return await spawnWindowsBootstrapRecoveryHandoff(reason, updater)
+  } finally {
+    reservation.release()
+  }
+}
+
+async function spawnWindowsBootstrapRecoveryHandoff(reason, updater) {
   const updateRoot = resolveUpdateRoot()
   const { branch: configuredBranch } = readDesktopUpdateConfig()
 
@@ -13253,6 +13338,7 @@ async function startHermes() {
 
     const message = error instanceof Error ? error.message : String(error)
     const hostKeyChanged = isHostKeyChangedBootFailure(error)
+    const transientDeferral = isTransientDeferralFailure(error)
 
     // Carry structured Cloud-down metadata through the boot-progress / IPC
     // boundary when present, so the renderer overlay can key on it rather than
@@ -13270,8 +13356,11 @@ async function startHermes() {
     // timeout / host briefly unreachable across sleep) is transient and has no
     // child 'exit' handler to clear the cache — latching it would wedge the app
     // on "session expired" until a full restart, defeating reconnect, the
-    // "Sign out & sign in" reload, and the wake-recovery revalidate path.
-    if (shouldLatchBackendStartFailure({ attemptedRemote })) {
+    // "Sign out & sign in" reload, and the wake-recovery revalidate path. A
+    // tagged local deferral is the local exception: latching a hand-off that
+    // only refused because managed update work owns the install would wedge
+    // every later start on a refusal that clears itself.
+    if (shouldLatchBackendStartFailure({ attemptedRemote, isTransientDeferral: transientDeferral })) {
       backendStartFailure = error instanceof Error ? error : new Error(message)
     }
 
@@ -13302,12 +13391,14 @@ async function startHermes() {
         // timeout) is retryable — the renderer re-attempts the boot with
         // bounded backoff. Local failures, confirmed reauth rejections, and
         // host-key changes are not: those end in the recovery overlay /
-        // sign-in affordance.
-        retryable: isRetryableRemoteBootFailure({
-          attemptedRemote,
-          isReauth: isReauthRequiredError(error),
-          isHostKeyChanged: hostKeyChanged
-        }),
+        // sign-in affordance. A tagged local updater deferral is the one local
+        // exception — it self-heals when the managed work it waits on finishes.
+        retryable:
+          isRetryableRemoteBootFailure({
+            attemptedRemote,
+            isReauth: isReauthRequiredError(error),
+            isHostKeyChanged: hostKeyChanged
+          }) || isRetryableLocalDeferral({ attemptedRemote, isTransientDeferral: transientDeferral }),
         running: false,
         statusCode: Number.isInteger(statusCode) ? statusCode : undefined
       },
@@ -15826,6 +15917,12 @@ async function requestManagedSshUpdate(rawId) {
   }
 
   const correlationId = crypto.randomUUID()
+
+  // Sibling refusal: isQuittingForHandoff outlives updateInFlight through the post-finally dwell.
+  if (localHandoffBlock(localHandoffSignals)) {
+    return refusedManagedSshUpdate(connectionId, correlationId, 'A local/client update hand-off is in progress.')
+  }
+
   const registry = readDesktopConnectionsRegistry()
   const source = registry.connections.find(connection => connection.id === connectionId)
 
@@ -15880,63 +15977,83 @@ ipcMain.handle('hermes:connections:update-all', async (_event, payload) => {
     Array.isArray((payload as any)?.excludeIds) ? (payload as any).excludeIds.map((id: unknown) => String(id)) : []
   )
 
-  const results = await Promise.all(
-    registry.connections
-      .filter(connection => !excludeIds.has(connection.id))
-      .map(async connection => {
-        const base = { connectionId: connection.id, label: connection.label, kind: connection.kind }
-        const eligibility = updateEligibility(connection)
+  // Remote rows dispatch concurrently but settle before local starts, even
+  // if local appears first in the registry (Sep 1 Windows abort).
+  const results = await dispatchUpdatesRemoteFirst(
+    registry.connections.filter(connection => !excludeIds.has(connection.id)),
+    // The registry reader is untyped, so the generic's element type resolves to
+    // its constraint; annotate to keep the row's original inferred shape.
+    async (connection: any) => {
+      const base = { connectionId: connection.id, label: connection.label, kind: connection.kind }
+      const eligibility = updateEligibility(connection)
 
-        if (!eligibility.eligible) {
-          return { ...base, ok: false, skipped: true, reason: eligibility.reason }
+      if (!eligibility.eligible) {
+        return { ...base, ok: false, skipped: true, reason: eligibility.reason }
+      }
+
+      try {
+        if (connection.kind === 'local') {
+          // The app-managed runtime updates through the same pipeline as the
+          // Settings → Updates button (marker + venv gate + relaunch flow).
+          const result: any = await applyUpdates({})
+
+          return { ...base, ok: result?.ok !== false, detail: result?.message || 'update started' }
         }
 
-        try {
-          if (connection.kind === 'local') {
-            // The app-managed runtime updates through the same pipeline as the
-            // Settings → Updates button (marker + venv gate + relaunch flow).
-            const result: any = await applyUpdates({})
+        if (connection.kind === 'ssh') {
+          const result = await requestManagedSshUpdate(connection.id)
 
-            return { ...base, ok: result?.ok !== false, detail: result?.message || 'update started' }
+          return {
+            ...base,
+            ok: result.ok,
+            detail: result.message,
+            managed: result,
+            ...(result.ok ? {} : { error: result.error || result.outcome })
           }
+        }
 
-          if (connection.kind === 'ssh') {
-            const result = await requestManagedSshUpdate(connection.id)
-
-            return {
-              ...base,
-              ok: result.ok,
-              detail: result.message,
-              managed: result,
-              ...(result.ok ? {} : { error: result.error || result.outcome })
-            }
-          }
-
+        // Same lifecycle refusal the managed SSH sibling makes, in both phases
+        // (guardedRemoteRowUpdate rechecks after the dial's await).
+        return await guardedRemoteRowUpdate(
+          base,
+          localHandoffSignals,
           // Claim-guarded (#90812): coalesce with a concurrent renderer dial
           // for the same connection instead of bootstrapping a second backend.
-          const descriptor: any = await backendDialClaims.run(backendScopeKey(connection.id, null), () =>
-            ensureRegistryBackend(connection.id, null)
-          )
+          () =>
+            backendDialClaims.run(backendScopeKey(connection.id, null), () =>
+              ensureRegistryBackend(connection.id, null)
+            ),
+          async (descriptor: any) => {
+            const body: any = await postJsonForBackend(descriptor, '/api/hermes/update', {}, { timeoutMs: 15_000 })
 
-          const body: any = await postJsonForBackend(descriptor, '/api/hermes/update', {}, { timeoutMs: 15_000 })
-
-          if (body?.ok === false) {
-            // The backend refused (docker/nix/externally-managed installs) —
-            // surface ITS message, per-row, instead of failing the batch.
-            return {
-              ...base,
-              ok: false,
-              skipped: true,
-              reason: body?.error || 'backend-refused',
-              detail: body?.message
+            if (body?.ok === false) {
+              // The backend refused (docker/nix/externally-managed installs) —
+              // surface ITS message, per-row, instead of failing the batch.
+              return {
+                ...base,
+                ok: false,
+                skipped: true,
+                reason: body?.error || 'backend-refused',
+                detail: body?.message
+              }
             }
-          }
 
-          return { ...base, ok: true, detail: body?.message || 'update started' }
-        } catch (error: any) {
-          return { ...base, ok: false, error: String(error?.message || error) }
-        }
-      })
+            return { ...base, ok: true, detail: body?.message || 'update started' }
+          }
+        )
+      } catch (error: any) {
+        return { ...base, ok: false, error: String(error?.message || error) }
+      }
+    },
+    // A row that throws OUTSIDE its own try (base/eligibility) is still that
+    // row's failure — never the whole batch's.
+    (connection: any, error: any) => ({
+      connectionId: connection.id,
+      label: connection.label,
+      kind: connection.kind,
+      ok: false,
+      error: String(error?.message || error)
+    })
   )
 
   return { ok: true, results }

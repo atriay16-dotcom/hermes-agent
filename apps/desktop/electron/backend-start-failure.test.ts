@@ -4,8 +4,12 @@ import { test } from 'vitest'
 
 import { isReauthRequiredError, makeUnsignedOauthError } from './backend-health'
 import {
+  type BackendStartFailureContext,
+  type RemoteBootRetryContext,
   isHostKeyChangedBootFailure,
+  isRetryableLocalDeferral,
   isRetryableRemoteBootFailure,
+  isTransientDeferralFailure,
   shouldLatchBackendStartFailure,
   shouldLatchHostKeyChangedFailure,
   shouldLatchRemoteReauthFailure
@@ -134,6 +138,62 @@ test('host-key latch never fires for local failures or ordinary remote faults', 
     false
   )
   assert.equal(shouldLatchHostKeyChangedFailure({ attemptedRemote: true, isReauth: false }), false)
+})
+
+test('FIX: a tagged LOCAL updater deferral neither latches nor reports terminal', () => {
+  // handOffWindowsBootstrapRecovery() refuses to start a recovery hand-off while
+  // a managed SSH update / local hand-off owns the install, and throws the
+  // deferral tagged isTransientDeferral. That refusal reached the outer
+  // startHermes catch as a LOCAL failure, so it latched into backendStartFailure
+  // and reported retryable:false — every later start re-threw the cached error
+  // long after the managed work finished. Production composes the retry answer
+  // from both rungs; the deferral rung only ever adds the LOCAL one.
+  const retryable = (context: RemoteBootRetryContext & BackendStartFailureContext) =>
+    isRetryableRemoteBootFailure(context) || isRetryableLocalDeferral(context)
+  const deferral = { attemptedRemote: false, isReauth: false, isTransientDeferral: true }
+
+  assert.equal(shouldLatchBackendStartFailure(deferral), false)
+  assert.equal(retryable(deferral), true)
+
+  // Control: an ordinary local bootstrap/install failure still latches and must
+  // not enter the retry loop (that is the install-restart loop this latch exists
+  // to break).
+  const localFailure = { attemptedRemote: false, isReauth: false }
+  assert.equal(shouldLatchBackendStartFailure(localFailure), true)
+  assert.equal(retryable(localFailure), false)
+
+  // Controls: remote classification is behaviour-identical even when a remote
+  // error also carries the deferral tag. Confirmed reauth and a changed host key
+  // stay terminal; an ordinary remote fault still self-heals.
+  const reauth = { attemptedRemote: true, isReauth: true, isTransientDeferral: true }
+  assert.equal(shouldLatchBackendStartFailure(reauth), false)
+  assert.equal(shouldLatchRemoteReauthFailure(reauth), true)
+  assert.equal(retryable(reauth), false)
+
+  const hostKeyChanged = { attemptedRemote: true, isReauth: false, isHostKeyChanged: true, isTransientDeferral: true }
+  assert.equal(shouldLatchHostKeyChangedFailure(hostKeyChanged), true)
+  assert.equal(retryable(hostKeyChanged), false)
+
+  assert.equal(retryable({ attemptedRemote: true, isReauth: false }), true)
+})
+
+test('FIX: only the explicitly tagged deferral classifies as transient; committed hand-offs stay terminal', () => {
+  // The shapes main.ts actually throws: deferredRecoveryHandoff tags both
+  // isBootstrapFailure and isTransientDeferral; a committed hand-off and a
+  // genuine install failure carry isBootstrapFailure alone and must stay latched.
+  const deferred = Object.assign(new Error('Hermes recovery is waiting: a managed SSH update is running (host).'), {
+    isBootstrapFailure: true,
+    isTransientDeferral: true
+  })
+  const handedOff = Object.assign(new Error('Hermes recovery was handed off to Hermes Setup.'), {
+    isBootstrapFailure: true,
+    bootstrapHandedOff: true
+  })
+
+  assert.equal(isTransientDeferralFailure(deferred), true)
+  assert.equal(isTransientDeferralFailure(handedOff), false)
+  assert.equal(isTransientDeferralFailure(new Error("Hermes bootstrap failed at stage 'venv'")), false)
+  assert.equal(isTransientDeferralFailure(null), false)
 })
 
 test('every remote failure picks exactly one path: retry, reauth latch, or host-key latch', () => {

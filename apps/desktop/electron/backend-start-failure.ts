@@ -28,16 +28,36 @@ export interface BackendStartFailureContext {
    * cloud) primary backend rather than spawning a local child.
    */
   attemptedRemote: boolean
+  /** True when the failure is a tagged deferral (see `isTransientDeferralFailure`). */
+  isTransientDeferral?: boolean
 }
 
 /**
  * Whether a startHermes() failure should latch into `backendStartFailure`.
  * Latch local failures (prevent install-restart loops); never latch remote
  * failures (they are transient and must stay retryable so recovery paths work
- * without an app restart).
+ * without an app restart), and never latch a tagged local deferral.
  */
 export function shouldLatchBackendStartFailure(context: BackendStartFailureContext): boolean {
-  return !context.attemptedRemote
+  return !context.attemptedRemote && context.isTransientDeferral !== true
+}
+
+/**
+ * `deferredRecoveryHandoff` (main.ts) tags the refusal it throws while a managed
+ * SSH update or another local hand-off owns the install — the one local bootstrap
+ * failure that self-heals. A committed hand-off and a genuine install failure
+ * carry `isBootstrapFailure` WITHOUT this tag and stay terminal.
+ */
+export function isTransientDeferralFailure(error: unknown): boolean {
+  return (error as { isTransientDeferral?: boolean } | null | undefined)?.isTransientDeferral === true
+}
+
+/**
+ * Only tagged LOCAL deferrals may enter the bounded boot retry loop. Keep
+ * remote classification separate so this tag cannot override its terminal guards.
+ */
+export function isRetryableLocalDeferral(context: BackendStartFailureContext): boolean {
+  return !context.attemptedRemote && context.isTransientDeferral === true
 }
 
 export interface RemoteReauthFailureContext {

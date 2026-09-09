@@ -1,0 +1,107 @@
+name: Updater candidate validation
+
+# Fork-only verification. No release, deploy, installer or publishing steps.
+# These checks do not certify an installed Desktop's complete update/relaunch.
+on:
+  push:
+    branches: [ci/updater-validation-507a89222e93]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: updater-validation-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  desktop:
+    name: Desktop checks (${{ matrix.os }})
+    if: github.repository == 'atriay16-dotcom/hermes-agent'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    defaults:
+      run:
+        shell: bash
+    env:
+      HERMES_HOME: ${{ runner.temp }}/updater-validation-home
+      CI: 'true'
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 26
+      - name: Verify reviewed source identity
+        run: |
+          node --input-type=module <<'JS'
+          import { execFileSync } from 'node:child_process';
+          import { createHash } from 'node:crypto';
+          const expected = {
+            'backend-start-failure.test.ts': '1392f3ab31f3eaeb6b7f999021184eb93677fb75119065a4314a9e97510b9718',
+            'backend-start-failure.ts': '7d7f1411c09e25a5bbb81163de7521bcce5913022dc8aad71c9ea7758f1cb034',
+            'main.ts': '89382e8e82a1248c84c03fd88f4279651aa62b71cef112ae77eaeff2cbc6d896',
+            'update-gate.test.ts': '5aec2810de38bc660d27f2ca2263f3f40c457da0fee852eb57a74f4696758929',
+            'update-gate.ts': '14b715bc7afb351123f25e6cca9d7c9c49797af24ec0958627c56cd31997f685'
+          };
+          console.log('Commit:', execFileSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8' }).trim());
+          for (const [name, hash] of Object.entries(expected)) {
+            const bytes = execFileSync('git', ['show', `HEAD:apps/desktop/electron/${name}`]);
+            if (createHash('sha256').update(bytes).digest('hex') !== hash) throw new Error(`Source mismatch: ${name}`);
+            console.log('Verified:', name);
+          }
+          JS
+      - name: Match upstream npm toolchain
+        run: npm install --global npm@12
+      - name: Install locked workspace dependencies
+        id: install
+        run: npm ci
+      - name: Full Desktop typecheck
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        run: npm run typecheck --workspace apps/desktop
+      - name: Canonical Electron project tests
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        run: npm exec --workspace apps/desktop -- vitest run --project electron --maxWorkers=2 --no-file-parallelism
+      - name: Canonical renderer project tests
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        run: npm exec --workspace apps/desktop -- vitest run --project ui --maxWorkers=2 --no-file-parallelism
+      - name: Changed-source formatting
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        run: >-
+          npm exec --workspace apps/desktop -- prettier --check
+          electron/backend-start-failure.ts electron/backend-start-failure.test.ts
+          electron/main.ts electron/update-gate.ts electron/update-gate.test.ts
+
+  windows-handoff:
+    name: Native Windows handoff self-test
+    if: github.repository == 'atriay16-dotcom/hermes-agent'
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Exercise real pipe-drain and child-lifecycle self-test
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $sandbox = Join-Path $env:RUNNER_TEMP 'updater-handoff-selftest'
+          New-Item -ItemType Directory -Path $sandbox -Force | Out-Null
+          $env:TEMP = $sandbox
+          $env:TMP = $sandbox
+          $env:HERMES_HOME = $sandbox
+          $env:HERMES_UPDATE_PIPE_DRAIN_SECONDS = '3'
+          $env:HERMES_UPDATE_STEP_IDLE_SECONDS = '3'
+          $env:HERMES_SELFTEST_HOLD_SECONDS = '45'
+          $powershell = Join-Path $env:SystemRoot 'System32/WindowsPowerShell/v1.0/powershell.exe'
+          if (-not (Test-Path -LiteralPath $powershell)) { throw 'Native Windows PowerShell is required' }
+          $script = Join-Path $env:GITHUB_WORKSPACE 'scripts/desktop-update/windows.ps1'
+          $output = & $powershell -NoProfile -ExecutionPolicy Bypass -File $script -SelfTestPipeDrain -NoUi 2>&1
+          $code = $LASTEXITCODE
+          $output | ForEach-Object { Write-Output $_ }
+          if ($code -ne 0) { throw "Handoff self-test exited $code" }
+          if (($output -join "`n") -notmatch 'PIPE-DRAIN SELF-TEST: PASS') { throw 'Missing native self-test success receipt' }
