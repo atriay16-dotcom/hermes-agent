@@ -87,8 +87,10 @@ def test_followers_survive_compression_and_restart_in_order_exactly_once(tmp_pat
         'model': {'provider': 'custom', 'default': 'original', 'base_url': url, 'context_length': 64000},
         'auxiliary': {'title_generation': {'enabled': False},
                       'compression': {'provider': 'custom', 'model': 'summary', 'base_url': url}},
+        # Pin the legacy tail budget for this fixture; lean uses a half-trigger budget with whole-row/anchor
+        # overruns, so PRESSURE_1's retention depends on which turn triggers compaction.
         'compression': {'protect_first_n': 1, 'protect_last_n': 2, 'threshold_tokens': 12000,
-                        'threshold': 0.5, 'in_place': False},
+                        'threshold': 0.5, 'in_place': False, 'tail_mode': 'legacy'},
         'platform_toolsets': {'cli': []}}))
     (home / 'models_dev_cache.json').write_text(json.dumps({'custom': {'id': 'custom', 'models': {
         name: {'id': name, 'name': name, 'limit': {'context': 64000 if name == 'original' else 1000000,
