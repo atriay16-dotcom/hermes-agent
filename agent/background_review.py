@@ -1189,7 +1189,7 @@ def release_cache_parity_fork(
 def _run_review_fork(
     agent: Any, messages_snapshot: list[dict], prompt: str, task_cfg: Optional[dict[str, Any]],
     review_run: Optional[_BackgroundReviewRun], st: _ReviewForkState, review_memory: bool = False,
-    explicit: bool = False,
+    explicit: bool = False, *, turn_author: Optional[dict[str, Any]] = None,
 ) -> None:
     """Fork phase (inside thread-scoped silence): build the fork, run the prompt under the tool
     whitelist, snapshot its messages/usage, release its clients. Partial progress lands on ``st``
@@ -1232,6 +1232,8 @@ def _run_review_fork(
                     "at runtime — do not attempt them." + prompt_extra
                 ),
                 conversation_history=_digest_history(messages_snapshot) if _routed else messages_snapshot,
+                # skip_memory leaves no external provider to refuse a bot's write; the built-in tool reads this.
+                turn_author=turn_author,
             )
     finally:
         clear_thread_tool_whitelist()
@@ -1261,7 +1263,7 @@ def _publish_review_summary(agent: Any, actions: list[str]) -> None:
 def _run_review_in_thread(
     agent: Any, messages_snapshot: list[dict], prompt: str,
     task_cfg: Optional[dict[str, Any]] = None, review_run: Optional[_BackgroundReviewRun] = None,
-    review_memory: bool = False, explicit: bool = False,
+    review_memory: bool = False, explicit: bool = False, *, turn_author: Optional[dict[str, Any]] = None,
 ) -> None:
     """Daemon-thread worker: build the fork, run the prompt, surface the action summary via
     ``agent._safe_print`` / ``background_review_callback``. ``review_run`` (from
@@ -1297,7 +1299,8 @@ def _run_review_in_thread(
         # to devnull and leaves all other threads on the real streams.
         from tools.skills_tool import bind_turn_secret_capture
         with thread_scoped_silence(), bind_turn_secret_capture(_bg_review_skip_secret):
-            _run_review_fork(agent, messages_snapshot, prompt, task_cfg, review_run, st, review_memory, explicit)
+            _run_review_fork(agent, messages_snapshot, prompt, task_cfg, review_run, st, review_memory, explicit,
+                             turn_author=turn_author)
         # A buggy/legacy tool response shape must NOT take down the whole review (the outer
         # except would discard every action the fork DID complete), so coerce to an empty list.
         try:
@@ -1354,14 +1357,14 @@ def spawn_background_review_thread(
     agent: Any, messages_snapshot: list[dict], review_memory: bool = False,
     review_skills: bool = False, focus: Optional[str] = None,
     task_cfg: Optional[dict[str, Any]] = None, review_run: Optional[_BackgroundReviewRun] = None,
-    explicit: bool = False,
+    explicit: bool = False, *, turn_author: Optional[dict[str, Any]] = None,
 ):
     """Return ``(target, prompt)``; the caller builds the ``threading.Thread`` so test patches of
     ``run_agent.threading.Thread`` keep working. ``focus`` (``/refine [instructions]``) is appended
     to the chosen prompt; automatic reviews pass ``None``. ``task_cfg`` is the pre-loaded
     ``auxiliary.background_review`` block; when omitted it is read once here. ``explicit``
     (/refine) propagates to the fork's write origin so user-requested reviews keep the full
-    memory operation set."""
+    memory operation set. ``turn_author`` is the reviewed turn's author, captured by the caller."""
     if task_cfg is None:
         task_cfg = _background_review_task_config()
     # Per-agent overrides (agent._MEMORY_REVIEW_PROMPT etc.) keep working.
@@ -1376,7 +1379,7 @@ def spawn_background_review_thread(
     def _target() -> None:  # resolves _run_review_in_thread at call time (tests patch it)
         _run_review_in_thread(
             agent, messages_snapshot, prompt, task_cfg=task_cfg, review_run=review_run,
-            review_memory=review_memory, explicit=explicit)
+            review_memory=review_memory, explicit=explicit, turn_author=turn_author)
 
     return _target, prompt
 

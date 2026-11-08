@@ -170,6 +170,20 @@ _REPLACE_REMOVED = ("'replace' is not available; use 'patch'. old_text is the ex
                     "set old_text to the whole entry. Nothing was written.")
 
 
+def _bot_turn_refusal() -> Optional[str]:
+    """Refuse every change, staged or applied, while a bot authored the running turn. Both stores are read
+    back as the owner's own facts with no record of who said them, so a bot's report must not land there;
+    it stays in the session transcript. Runs after argument validation and before anything is written."""
+    from agent.turn_author import current_turn_author
+
+    author = current_turn_author()
+    if not (author and author.get("is_bot")):
+        return None
+    FAILURE_CLASS.set("gate_refused")
+    return tool_error("This turn's message came from a bot, not the user, so built-in memory cannot be changed "
+                      "in it. Nothing was written or staged; do not retry.", success=False)
+
+
 def destructive_ops(payload: dict[str, Any]) -> list[dict[str, Any]]:
     """The replace/remove ops of a staged memory payload, single-op or batch shape."""
     ops = (payload.get("operations") or []) if payload.get("action") == "batch" else [payload]
@@ -260,7 +274,7 @@ def _memory_tool(action, target, content, old_text, new_text, operations, store)
             return _invalid("operations must be a list of {action, content?, old_text?} objects.")
         if any(isinstance(op, dict) and op.get("action") == "replace" for op in operations):
             return _invalid(_REPLACE_REMOVED)
-        denied = _background_delete_gate(store, action, operations, target)
+        denied = _bot_turn_refusal() or _background_delete_gate(store, action, operations, target)
         if denied is not None:
             return "rejected", denied
         # Approval gate: stages (background/gateway) or prompts inline (CLI); off by default.
@@ -282,6 +296,7 @@ def _memory_tool(action, target, content, old_text, new_text, operations, store)
     if action not in _STORE_ACTIONS:
         return _invalid(f"Unknown action '{action}'. Use: add, patch, remove")
     invalid = (_validate_single_op(store, action, target, content, old_text)
+               or _bot_turn_refusal()
                or _background_delete_gate(store, action, None, target, content, old_text)
                or _apply_write_gate(store, action, target, content, old_text))
     if invalid is not None:

@@ -6,13 +6,22 @@ gateway agent sees several authors over its lifetime, so the author is read per 
 
 from __future__ import annotations
 
+import contextvars
 import json
 import os
 import socket
 import unicodedata
-from typing import Any, Dict, Mapping, MutableMapping, Optional
+from contextlib import contextmanager
+from types import MappingProxyType
+from typing import Any, Dict, Iterator, Mapping, MutableMapping, Optional
 
 TURN_AUTHOR_ENV = "HERMES_TURN_AUTHOR"
+
+# The author of the turn running in this context, as a read-only private copy; unset outside any turn. Tool
+# workers and the review thread run in copies of the turn's context, so one that outlives its turn keeps that
+# turn's author while the agent's own ``_turn_author`` moves on to the next one.
+_NO_TURN = object()
+_bound_author: contextvars.ContextVar[Any] = contextvars.ContextVar("turn_author", default=_NO_TURN)
 
 _MAX_FIELD_LEN = 200
 _MAX_CHAIN_HOPS = 1000
@@ -84,6 +93,27 @@ def parse_turn_author(raw: Any) -> Optional[dict[str, Any]]:
         return author
     except Exception:
         return None
+
+
+@contextmanager
+def bound_turn_author(raw: Any) -> Iterator[None]:
+    """Bind the normalized author for one turn, then restore the enclosing binding, so a child turn run on
+    the same thread cannot leave its author (or its absence) behind in the parent's turn."""
+    author = parse_turn_author(raw)
+    token = _bound_author.set(None if author is None else MappingProxyType(author))
+    try:
+        yield
+    finally:
+        _bound_author.reset(token)
+
+
+def current_turn_author(fallback: Any = None) -> Optional[dict[str, Any]]:
+    """A fresh copy of the author bound for the turn running in this context. Outside any turn, ``fallback``
+    normalized: the caller's best record of who wrote what it is acting on."""
+    author = _bound_author.get()
+    if author is _NO_TURN:
+        return parse_turn_author(fallback)
+    return None if author is None else dict(author)
 
 
 def turn_author_from_env(environ: Mapping[str, str] = os.environ) -> Optional[dict[str, Any]]:
