@@ -22,8 +22,12 @@ def _local_session(runner, source):
     return local_authority_live(runner, source)
 
 
-async def refine_local_session(runner, source, focus):
-    """The ``/refine`` reply for a local session, or None when ``source`` is not one."""
+async def refine_local_session(runner, source, focus, *, turn_author=None):
+    """The ``/refine`` reply for a local session, or None when ``source`` is not one. ``turn_author`` is
+    whoever issued the command (``command_turn_author``); the review fork runs as that author."""
+    from agent.turn_author import parse_turn_author
+    # A private copy taken before any await: the review runs on a bare thread, and the caller's dict may change.
+    author = parse_turn_author(turn_author)
     authority, live = _local_session(runner, source)
     if live is None:
         return None
@@ -87,7 +91,7 @@ async def refine_local_session(runner, source, focus):
                 review, _prompt = spawn_background_review_thread(
                     agent, _clone_background_review_messages(history), review_memory=True,
                     review_skills='skill_manage' in getattr(agent, 'valid_tool_names', set()),
-                    focus=focus or None, review_run=run, explicit=True)
+                    focus=focus or None, review_run=run, explicit=True, turn_author=author)
                 review()
             finally:
                 with contextlib.suppress(Exception):

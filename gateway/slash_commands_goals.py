@@ -179,12 +179,16 @@ class GatewayGoalCommandsMixin:
         args = (event.get_command_args() or "").strip()
         quick_key, agent, error = self._idle_cached_agent_or_error(event, "refine")
         snapshot = list(getattr(agent, "_session_messages", None) or [])
-        session_id = None
+        session_id = author = None
         if not snapshot and quick_key and quick_key not in self._running_agents:
+            # Whoever issued this command, captured before the first await: the local and cold reviews run on
+            # fresh agents with no last-turn author, and the memory guard refuses a bot's writes by it.
+            from gateway.session_ingress import command_turn_author
+            author = command_turn_author(self, event.source)
             # A local session's conversation is its stored transcript, not the cached agent: /moa
             # (and its settle) drop that agent, so /refine reads the session itself (T7).
             from gateway.session_refine import refine_local_session
-            local = await refine_local_session(self, event.source, args)
+            local = await refine_local_session(self, event.source, args, turn_author=author)
             if local is not None:
                 return local
             # A released cached agent (idle TTL, pressure, /moa), or one holding no messages, is not
@@ -204,7 +208,7 @@ class GatewayGoalCommandsMixin:
         try:
             if agent is None:
                 from gateway.session_cold_review import start_cold_refine
-                await start_cold_refine(self, event.source, quick_key, session_id, snapshot, args)
+                await start_cold_refine(self, event.source, quick_key, session_id, snapshot, args, turn_author=author)
             else:
                 agent._spawn_background_review(
                     messages_snapshot=snapshot, review_memory=True,

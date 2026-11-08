@@ -96,16 +96,19 @@ def cold_review_parent(runner, source, session_key, session_id):
                 agent.release_clients()
 
 
-def start_cold_refine(runner, source, session_key, session_id, history, focus):
+def start_cold_refine(runner, source, session_key, session_id, history, focus, *, turn_author=None):
     """``/refine`` for a messaging session whose cached agent is gone: the resident path's own
     ``_spawn_background_review`` call, made from the cold parent. A resident agent sends its review
     summary into the chat through its last turn's callback (``run_turn_runner._make_bg_review_callbacks``);
     this one sends it to the same chat and thread directly. Returns a future that resolves once the review
     is spawned (or raises its start error); the parent's clients are released when the review's request ends,
-    on the thread that built it."""
+    on the thread that built it. ``turn_author`` is whoever issued the command (``command_turn_author``)."""
     from agent.async_utils import safe_schedule_threadsafe
     from agent.memory_provider import spawn_context_thread
+    from agent.turn_author import bound_turn_author, parse_turn_author
     from gateway.run import _interim_metadata, _non_conversational_metadata
+    # A private copy taken on the owner loop, before the thread: the caller's dict and source may change.
+    author = parse_turn_author(turn_author)
     loop = asyncio.get_running_loop()
     adapter = runner._delivery_adapter_for(source)
     metadata = _interim_metadata(_non_conversational_metadata(
@@ -122,10 +125,12 @@ def start_cold_refine(runner, source, session_key, session_id, history, focus):
         try:
             with cold_review_parent(runner, source, session_key, session_id) as parent:
                 parent.background_review_callback = deliver
-                parent._spawn_background_review(
-                    messages_snapshot=history, review_memory=True,
-                    review_skills="skill_manage" in getattr(parent, "valid_tool_names", set()), focus=focus or None,
-                    explicit=True)
+                # The fresh parent holds no turn's author: the chokepoint captures this binding instead.
+                with bound_turn_author(author):
+                    parent._spawn_background_review(
+                        messages_snapshot=history, review_memory=True,
+                        review_skills="skill_manage" in getattr(parent, "valid_tool_names", set()),
+                        focus=focus or None, explicit=True)
                 started.set_result(None)
                 run = getattr(parent, "_background_review_run", None)
                 if run is not None:
