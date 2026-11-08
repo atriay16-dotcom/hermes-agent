@@ -1,0 +1,206 @@
+name: Memory author guard (fork validation)
+
+# Owner-fork validation lane for one branch, on standard GitHub-hosted runners only.
+#
+# Every reusable workflow that runs the suite or the lint gates (tests.yml, lint.yml and the
+# standalone guard workflows) pins a blacksmith-* runner label and exposes no runner input, so
+# this file inlines their step bodies on ubuntu-24.04 instead of calling them. It reuses the
+# runner-agnostic composite actions (setup-pm, retry, check-clean-worktree), the real
+# scripts/run_tests.sh and the real scripts/check.
+#
+# What runs:
+#   tests         the ordinary Linux Python suite (bare scripts/run_tests.sh, the same file set
+#                 as tests.yml's "Run tests (n/3)") in four slices, zero file retries.
+#   source-gates  every blocking check scripts/check knows (the lint.yml jobs plus the
+#                 standalone guards), the code-health ratchet against the literal reviewed
+#                 baseline, and the lefthook pre-commit ruff config on the Python files changed
+#                 since that baseline.
+# What does not run here (and is not claimed): tests/e2e, tests/integration and tests/docker
+# (run_tests.sh discovery excludes them), the macOS/Windows lanes of tests-os.yml (tests
+# carrying platforms("macos"/"windows") report as skipped on Linux), Docker, Nix, JS and Rust.
+#
+# Inert outside the owner fork: the push filter names a single branch, and every job also
+# checks the repository and the ref. No pull_request, tag, release, schedule, workflow_run or
+# workflow_dispatch trigger (a dispatch is unavailable anyway while the fork's default branch
+# lacks this file); repeat a run with a re-push or `gh run rerun`.
+
+on:
+  push:
+    branches:
+      - fix/honcho-agent-upgrade-20261108
+
+permissions:
+  contents: read
+
+concurrency:
+  group: memory-author-guard-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tests:
+    name: Python tests (${{ matrix.slice }}/4)
+    if: github.repository == 'atriay16-dotcom/hermes-agent' && github.event_name == 'push' && github.ref == 'refs/heads/fix/honcho-agent-upgrade-20261108'
+    runs-on: ubuntu-24.04
+    # tests.yml packs ~10 min of work onto 32 cores per three slices; one quarter of it on 4
+    # vCPUs is expected to take roughly 25-45 min. Split further rather than raise this.
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        slice: [1, 2, 3, 4]
+    steps:
+      - name: Checkout the exact pushed commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Install ripgrep (prebuilt binary, verified)
+        # Same pinned release and checksum as tests.yml, unpacked under $RUNNER_TEMP and put on
+        # PATH for later steps (run_tests.sh forwards PATH), so neither sudo nor the checkout
+        # is touched.
+        run: |
+          set -euo pipefail
+          RG_VERSION=15.1.0
+          RG_SHA256=1c9297be4a084eea7ecaedf93eb03d058d6faae29bbc57ecdaf5063921491599
+          RG_TARBALL=ripgrep-${RG_VERSION}-x86_64-unknown-linux-musl.tar.gz
+          RG_DIR="$RUNNER_TEMP/ripgrep"
+          mkdir -p "$RG_DIR"
+          curl -sSfL --retry 3 --retry-delay 5 -o "$RG_DIR/$RG_TARBALL" \
+            "https://github.com/BurntSushi/ripgrep/releases/download/${RG_VERSION}/${RG_TARBALL}"
+          (cd "$RG_DIR" && echo "${RG_SHA256}  ${RG_TARBALL}" | sha256sum -c -)
+          tar -xzf "$RG_DIR/$RG_TARBALL" -C "$RG_DIR"
+          echo "$RG_DIR/ripgrep-${RG_VERSION}-x86_64-unknown-linux-musl" >> "$GITHUB_PATH"
+          "$RG_DIR/ripgrep-${RG_VERSION}-x86_64-unknown-linux-musl/rg" --version
+
+      - name: Set up locked Python and test dependencies
+        # Same packages and extras as tests.yml's test job (pnpm: tests that drive the real
+        # scripts/build/node-deps.mjs need it, and with it PM's Node, on PATH). The action's home
+        # is $RUNNER_TEMP/setup-pm; the dev+test environment is built there and exported as
+        # HERMES_PYTHON. Caches off: this lane writes nothing to the fork's Actions cache.
+        uses: ./.github/actions/setup-pm
+        with:
+          packages: pnpm
+          extras: '["all", "anthropic", "bedrock", "mistral", "fal", "modal", "daytona", "parallel-web", "keychain"]'
+          test-environment: 'true'
+          cache: 'false'
+          cache-python: 'false'
+
+      - name: Verify the commit and the test interpreter
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          echo "commit: $GITHUB_SHA"
+          echo "HERMES_HOME=$HERMES_HOME"
+          echo "HERMES_PYTHON=$HERMES_PYTHON"
+          case "$HERMES_PYTHON" in
+            "$RUNNER_TEMP"/*) ;;
+            *) echo "::error::HERMES_PYTHON is not under RUNNER_TEMP: $HERMES_PYTHON"; exit 1 ;;
+          esac
+          "$HERMES_PYTHON" -c 'import sys, pytest; print(sys.executable, sys.version.split()[0], "pytest", pytest.__version__)'
+
+      - name: Check SQLite runs WAL
+        # Verbatim from tests.yml: a WAL-reset-vulnerable SQLite makes every WAL test silently
+        # run DELETE (or skip), so fail loudly instead.
+        run: |
+          "$HERMES_PYTHON" -c "import sqlite3, sys, hermes_state_wal as w; v = w.is_sqlite_wal_reset_vulnerable(); print(f'Python {sys.version.split()[0]}, SQLite {sqlite3.sqlite_version}, WAL-reset vulnerable: {v}'); sys.exit(1 if v else 0)"
+
+      - name: Run tests (${{ matrix.slice }}/4)
+        # Bare scripts/run_tests.sh: the runner discovers tests/ itself and partitions sorted
+        # files round-robin from the checkout alone, so the four slices agree without a planning
+        # job. No duration cache is restored, so the flat per-file cap applies. The runner
+        # starts pytest children from `env -i` and the conftest sandboxes each into a temporary
+        # HERMES_HOME. The runner's exit code is the step's exit code.
+        env:
+          SLICE: ${{ matrix.slice }}
+          HERMES_TEST_SLICE: ${{ matrix.slice }}/4
+          HERMES_TEST_WORKERS: "4"
+          HERMES_TEST_FORKSERVER: "1"
+          HERMES_TEST_FILE_TIMEOUT: "900"
+          # A failing file fails the slice; no pass-on-retry.
+          HERMES_TEST_FILE_RETRIES: "0"
+          # No secrets reach this workflow; these stay empty so no test can call a real API.
+          OPENROUTER_API_KEY: ""
+          OPENAI_API_KEY: ""
+          NOUS_API_KEY: ""
+        run: |
+          set -uo pipefail
+          log="$RUNNER_TEMP/tests-slice-$SLICE.log"
+          rc=0
+          scripts/run_tests.sh 2>&1 | tee "$log" || rc=$?
+          {
+            echo "### Python tests, slice $SLICE/4 (exit $rc)"
+            grep -E '^=== Summary:' "$log" || echo "no summary line: the runner did not finish"
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$rc"
+
+      - name: Check the checkout is clean
+        uses: ./.github/actions/check-clean-worktree
+
+  source-gates:
+    name: Source gates vs reviewed baseline
+    if: github.repository == 'atriay16-dotcom/hermes-agent' && github.event_name == 'push' && github.ref == 'refs/heads/fix/honcho-agent-upgrade-20261108'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      # The reviewed baseline the branch was cut from. Neither upstream derivation fits a fork
+      # branch push: the merge-base with origin/main judges every upstream commit since the
+      # fork's stale main, and HEAD^1 is just the previous commit when the branch holds more
+      # than one.
+      RATCHET_BASE: 2281116525106e3c109993ccb5dc74d02bfc1427
+    steps:
+      - name: Checkout the exact pushed commit with history
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Set up the locked PM toolchain
+        uses: ./.github/actions/setup-pm
+        with:
+          cache: 'false'
+          cache-python: 'false'
+
+      - name: Install pinned ruff through PM
+        # Same command as lint.yml: a PM-managed ci-tools environment with the ruff pin the
+        # code-health engine prints; it is exported as HERMES_PYTHON and put on PATH.
+        uses: ./.github/actions/retry
+        with:
+          command: python -m scripts.ci.python_packages "$(python -m scripts.code_health --print-pins)"
+
+      - name: Verify the commit and the baseline
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          git cat-file -e "${RATCHET_BASE}^{commit}"
+          git merge-base --is-ancestor "$RATCHET_BASE" "$GITHUB_SHA"
+          echo "head: $GITHUB_SHA"
+          echo "base: $RATCHET_BASE"
+          git log --oneline "$RATCHET_BASE..$GITHUB_SHA"
+          git diff --stat "$RATCHET_BASE" "$GITHUB_SHA"
+
+      - name: Every blocking check (scripts/check) against the baseline
+        # footguns, shebangs, no-tmp, detached-spawns, config-writers, config-readers,
+        # os-marker-fakes, agents-md, case-collisions, lazy-deps, profile-archives, blob-size,
+        # ruff and the code-health ratchet. --base feeds the ratchet and blob-size; the
+        # ratchet reads its ENFORCEMENT switch from the base commit.
+        run: python scripts/check --base "$RATCHET_BASE"
+
+      - name: Pre-commit ruff config on Python files changed since the baseline
+        # The lefthook pre-commit job (lefthook.yml: ruff check --config ./ruff.pre-commit.toml),
+        # applied to the files this branch changes. Deleted files are excluded.
+        run: |
+          set -euo pipefail
+          mapfile -d '' files < <(git diff -z --name-only --diff-filter=d "$RATCHET_BASE" "$GITHUB_SHA" -- '*.py')
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "no Python files changed since $RATCHET_BASE"
+            exit 0
+          fi
+          printf '%s\n' "${files[@]}"
+          ruff --version
+          ruff check --no-cache --config ./ruff.pre-commit.toml -- "${files[@]}"
+
+      - name: Check the checkout is clean
+        uses: ./.github/actions/check-clean-worktree
