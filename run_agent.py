@@ -773,9 +773,13 @@ class AIAgent(
         # Structural clone at the single chokepoint every review path (automatic, /refine, idle-queue
         # deferral) goes through. See #100795.
         from agent.turn_finalizer import _clone_background_review_messages
+        from agent.turn_author import current_turn_author
+        # The fork runs as the author of what it reviews, captured now as a private copy: a deferred fork
+        # starts after the next turn has replaced ``_turn_author``. Inside a turn that is the turn's own
+        # binding; /refine runs between turns and reviews the last one.
         kwargs = dict(messages_snapshot=_clone_background_review_messages(messages_snapshot),
                       review_memory=review_memory, review_skills=review_skills, focus=focus, task_cfg=task_cfg,
-                      explicit=explicit)
+                      explicit=explicit, turn_author=current_turn_author(getattr(self, "_turn_author", None)))
         if focus is None and not explicit and _review_should_defer(self, task_cfg):
             from agent.review_idle_queue import QUEUE
             QUEUE.enqueue(self, _review_queue_key(self), kwargs)
@@ -785,7 +789,7 @@ class AIAgent(
     def _spawn_background_review_now(self, messages_snapshot: list[dict], review_memory: bool = False,
                                      review_skills: bool = False, focus: Optional[str] = None,
                                      task_cfg: Optional[dict[str, Any]] = None, _requeue_attempts: int = 0,
-                                     explicit: bool = False) -> None:
+                                     explicit: bool = False, turn_author: Optional[dict[str, Any]] = None) -> None:
         """Spawn the background memory/skill review thread.
 
         ``threading.Thread`` is constructed here so tests patching ``run_agent.threading.Thread`` keep working.
@@ -805,7 +809,7 @@ class AIAgent(
         try:
             target, _prompt = spawn_background_review_thread(
                 self, messages_snapshot, review_memory=review_memory, review_skills=review_skills,
-                focus=focus, task_cfg=task_cfg, review_run=review_run, explicit=explicit,
+                focus=focus, task_cfg=task_cfg, review_run=review_run, explicit=explicit, turn_author=turn_author,
             )
 
             def _target_with_requeue() -> None:
@@ -813,7 +817,7 @@ class AIAgent(
                 self._maybe_requeue_preempted_review(review_run, dict(
                     messages_snapshot=messages_snapshot, review_memory=review_memory, review_skills=review_skills,
                     focus=focus, task_cfg=task_cfg, _requeue_attempts=_requeue_attempts + 1,
-                    explicit=explicit))
+                    explicit=explicit, turn_author=turn_author))
 
             # Carry the active profile into the review thread so MEMORY.md / skill review writes land in the
             # right profile.
