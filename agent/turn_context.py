@@ -645,6 +645,8 @@ def _bind_turn_identity(
     )
     agent._relay_pending_turn_id = None
     agent._current_turn_id = turn_id
+    # A new invocation never inherits the previous one's memory turn source (restamped at staging).
+    agent._memory_turn_source = None
     agent._current_api_request_id = ""
     # Tripwire: warn when this turn starts before the previous turn-end persist
     # (concurrent turns interleave transcript writes). Cleared in _persist_session.
@@ -764,6 +766,70 @@ def _stage_turn_user_message(
     if persist_user_platform_id is not None:
         user_msg["platform_message_id"] = persist_user_platform_id
     return user_msg, pending_cli_message
+
+
+# Producer-only origin of the user row an invocation admitted, for external memory providers. It rides
+# inside ``display_metadata`` (``PERSISTENCE_ONLY_MESSAGE_FIELDS``), so no wire copy or token estimate
+# ever carries it. See ``stamp_memory_turn_source`` for the contract.
+MEMORY_TURN_SOURCE_KEY = "memory_turn_source"
+
+
+def _has_memory_turn_source_consumer(agent: Any) -> bool:
+    """True only when the agent's configured memory manager says a provider declares ``turn_source``."""
+    accepts = getattr(getattr(agent, "_memory_manager", None), "accepts_turn_source", None)
+    try:
+        return callable(accepts) and accepts() is True
+    except Exception:
+        logger.debug("memory turn source consumer check failed; not stamping", exc_info=True)
+        return False
+
+
+def stamp_memory_turn_source(
+    agent: Any, user_msg: Any, conversation_history: Optional[list[Any]], turn_id: str,
+) -> None:
+    """Mark the user row THIS invocation admitted with a fresh origin and stash the same pair on the agent.
+
+    Contract: ``user_msg["display_metadata"]["memory_turn_source"] == {"turn_id": <native turn id>,
+    "marker": <agent.message_metadata.mint_uid()>}``, and ``agent._memory_turn_source`` holds an equal dict
+    that the finalizer forwards (``memory_turn_source_for``) as the optional ``turn_source`` of
+    ``MemoryManager.sync_all`` -> ``provider.sync_turn``. The marker is minted per invocation and never
+    derived from content, so identical inputs, a reused native turn id (relay retry) or a reused
+    ``message_uid`` (CLI handoff) still get distinct markers. It is staged when the input is created,
+    before any compaction; nothing recovers it later by searching history or matching text, so a row that
+    loses it (compaction, merge) simply has no origin. It is non-secret bookkeeping of which row this
+    invocation admitted, not authentication of who wrote it; it persists with the row's display metadata.
+
+    Nothing is stamped or stashed unless the agent's configured memory manager reports a source-aware
+    consumer (``MemoryManager.accepts_turn_source``): with no manager, no providers, or only providers whose
+    ``sync_turn`` does not declare ``turn_source``, rows and their stored metadata are exactly as before.
+    Also fails closed when the staged dict IS a historical row object or carries a non-dict
+    ``display_metadata``: tagging it would re-label history. A genuine new row keeps its dict identity (a
+    CLI handoff's identity and close markers matter to crash/close persistence) but gets a copied
+    ``display_metadata`` container, so metadata shared with the caller or an older row is never mutated."""
+    agent._memory_turn_source = None
+    if not isinstance(user_msg, dict) or not turn_id or not _has_memory_turn_source_consumer(agent):
+        return
+    metadata = user_msg.get("display_metadata")
+    if any(row is user_msg for row in conversation_history or ()) or not isinstance(metadata, (dict, type(None))):
+        logger.debug("memory turn source not stamped: the staged user row is not a genuine new row")
+        return
+    from agent.message_metadata import mint_uid
+
+    source = {"turn_id": str(turn_id), "marker": mint_uid()}
+    user_msg["display_metadata"] = {**(metadata or {}), MEMORY_TURN_SOURCE_KEY: dict(source)}
+    agent._memory_turn_source = source
+
+
+def memory_turn_source_for(agent: Any, turn_id: Any) -> Optional[dict[str, str]]:
+    """A fresh copy of the stashed memory turn source when it belongs to ``turn_id`` (the caller's
+    invocation-local id), else None: a later or foreign invocation's stash is never lent to this turn."""
+    source = getattr(agent, "_memory_turn_source", None)
+    if not (isinstance(source, dict) and isinstance(turn_id, str) and turn_id):
+        return None
+    marker = source.get("marker")
+    if source.get("turn_id") != turn_id or not (isinstance(marker, str) and marker):
+        return None
+    return {"turn_id": turn_id, "marker": marker}
 
 
 def _hydrate_from_history(agent: Any, conversation_history: Optional[list[Any]]) -> None:
@@ -1273,6 +1339,8 @@ def build_turn_context(
         agent, user_message, persist_user_message, persist_user_timestamp,
         persist_user_platform_id, persist_user_display_kind, persist_user_display_metadata,
     )
+    # Before append and any compaction: the origin is bound to the admitted row object itself.
+    stamp_memory_turn_source(agent, user_msg, conversation_history, turn_id)
     _hydrate_from_history(agent, conversation_history)
     # Every estimator this turn prices images at the cost learned from this model's real usage.
     bind_image_token_cost(agent)

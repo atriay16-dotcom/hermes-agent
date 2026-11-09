@@ -3,14 +3,18 @@
 The resident agent's ``/refine`` captures the author from the agent's last-turn stash. The local-session path
 (a fresh side agent on a bare thread) and the cold messaging path (a fresh parent agent) have no such stash, so
 the genuine author of the request executing the command has to be captured on the owner loop, before any await
-or thread hop, and carried to the fork: the admitted row's author (``execute_admission`` binds it), the
-authenticated peer of an A2A forward session's frozen policy, or the native sender's own bot flag. The built-in
-memory tool can then refuse a bot's durable write. Nothing is read from the focus text, the transcript or any
-caller-controlled metadata, and a local command no producer stamped stays author-less (legacy), as before.
+or thread hop, and carried to the fork: the admitted row's author (``execute_admission`` binds it, an A2A
+forwarded row as its authenticated peer via ``row_turn_author``) is authoritative, a human one included; only
+without one does the native sender's own flags apply, as the turn runner reads them. The built-in memory tool
+can then refuse a bot's durable write. A forward session's frozen policy names who wrote its forwarded turns,
+not who issues a later control command, so it is never read: a human ``session.command`` ``/refine`` on an A2A
+session is not the peer's. Nothing is read from the focus text, the transcript or any caller-controlled metadata,
+and a local command no producer stamped stays author-less (legacy, which is not a proof of a human), as before.
 
-Every case drives ``_handle_refine_command``: the real local and cold refine bodies, the real
-``_spawn_background_review`` / ``spawn_background_review_thread`` chain and the real fork construction run.
-Only session lookups, the side agent / cold parent construction and the model endpoint are stubbed.
+The route cases drive ``_handle_refine_command``: the real local and cold refine bodies, the real
+``_spawn_background_review`` / ``spawn_background_review_thread`` chain and the real fork construction run, with
+only session lookups, the side agent / cold parent construction and the model endpoint stubbed. The frozen-A2A
+cases run a real session authority, a real ``a2a.forward`` session and the public ``execute_command``.
 """
 from __future__ import annotations
 
@@ -197,10 +201,12 @@ async def _refine(event, runner=None):
 @pytest.mark.parametrize("admitted, policy, expected", [
     pytest.param(BOT, LOCAL_POLICY, BOT, id="bot-chat-delivery-admitted-as-the-bot"),
     pytest.param(HUMAN, LOCAL_POLICY, HUMAN, id="stamped-human-command"),
-    pytest.param(None, FORWARD_POLICY, PEER, id="a2a-forward-session-runs-as-the-authenticated-peer"),
+    pytest.param(PEER, FORWARD_POLICY, PEER, id="a2a-forwarded-row-admitted-as-the-authenticated-peer"),
+    pytest.param(HUMAN, FORWARD_POLICY, HUMAN, id="admitted-human-over-the-sessions-forward-policy"),
+    pytest.param(None, FORWARD_POLICY, None, id="unadmitted-command-on-a-forward-session-is-not-the-peers"),
     pytest.param(None, LOCAL_POLICY, None, id="hand-built-local-command-stays-legacy"),
 ])
-async def test_local_refine_runs_the_fork_as_the_commands_trusted_author(fork_runs, local, admitted, policy, expected):
+async def test_local_refine_runs_the_fork_as_the_commands_admitted_author(fork_runs, local, admitted, policy, expected):
     local.policy = policy
     with _admitted(None if admitted is None else dict(admitted)):
         await _refine(_event(local.source))
@@ -403,14 +409,36 @@ async def test_focus_and_transcript_text_cannot_forge_the_author(fork_runs, loca
 @pytest.mark.asyncio
 async def test_caller_metadata_cannot_downgrade_a_trusted_bot(fork_runs, local, cold):
     cold.parent = _bare_agent
-    # A native bot sender whose event carries a human-looking author, and whose admission was labelled human.
-    with _admitted(dict(HUMAN)):
-        await _refine(_event(_messaging_source(BOT_SENDER), turn_author=dict(HUMAN)))
-    # An admitted bot whose command event carries a human-looking author.
+    # A native bot sender, no admission bound, whose event carries a human-looking author.
+    await _refine(_event(_messaging_source(BOT_SENDER), turn_author=dict(HUMAN)))
+    # An admitted bot (on a human-looking source) whose command event carries a human-looking author.
     with _admitted(dict(BOT)):
         await _refine(_event(local.source, turn_author=dict(HUMAN)))
     local.join()
     assert [run["turn_author"] for run in fork_runs] == [BOT_SENDER, BOT]
+
+
+# ── The admitted author is authoritative; source flags only stand in when there is none ─────────────────────
+
+@pytest.mark.asyncio
+async def test_an_admitted_human_wins_over_bot_flags_on_the_source(fork_runs, local, cold):
+    """A producer-stamped human row (a viewer's submit, an API or CLI turn) runs as that human even where the
+    event's source is the session's stored one and carries a bot's flags, as the turn runner attributes it."""
+    cold.parent = _bare_agent
+    local.source.is_bot = True
+    with _admitted(dict(HUMAN)):
+        await _refine(_event(_messaging_source(BOT_SENDER)))
+        await _refine(_event(local.source))
+    local.join()
+    assert [run["turn_author"] for run in fork_runs] == [HUMAN, HUMAN]
+
+
+@pytest.mark.asyncio
+async def test_a_bot_flagged_local_source_without_an_admission_stays_bot(fork_runs, local):
+    local.source.is_bot = True
+    await _refine(_event(local.source))
+    local.join()
+    assert [run["turn_author"] for run in fork_runs] == [{"id": "owner", "name": "Owner", "is_bot": True}]
 
 
 # ── The cached-agent branch is unchanged ────────────────────────────────────────────────────────────────────
@@ -424,3 +452,119 @@ async def test_cached_agent_branch_call_is_unchanged():
         await _refine(_event(_messaging_source(BOT_SENDER), focus="tighten it"), _Runner(cached=cached))
     assert calls == [dict(messages_snapshot=TRANSCRIPT, review_memory=True, review_skills=True,
                           focus="tighten it", explicit=True)]
+
+
+# ── A frozen A2A session on the public control path: its forward policy is not the command's author ─────────
+
+async def _frozen_a2a_session(tmp_path, monkeypatch):
+    """A real session authority holding a real ``a2a.forward`` session (its frozen policy names peer alice), its
+    stored conversation and no cached agent. The forward is hosted by the local principal ``owner``, whose own later
+    connection is the human issuing commands. The forwarded row stays queued: no turn runs and no model is called."""
+    from gateway import run
+    from gateway.config import GatewayConfig
+    from gateway.session import SessionStore
+    from gateway.session_authority import initialize_session_authority
+    from gateway.session_contract import SessionRef
+    from gateway.session_controls import AuthorityConnection
+    monkeypatch.setattr(run, "_load_gateway_config",
+                        lambda: {"model": {"default": "fixture"}, "platform_toolsets": {"cli": []}})
+    monkeypatch.setattr(run, "_resolve_gateway_model", lambda _config: "fixture")
+    store = SessionStore(tmp_path / "sessions", GatewayConfig())
+    runner = run.GatewayRunner.__new__(run.GatewayRunner)
+    runner.adapters, runner.session_store, runner._session_db, runner._draining = {}, store, store._db, False
+    runner._running_agents, runner._agent_cache, runner._agent_cache_lock = {}, {}, threading.Lock()
+    authority = await initialize_session_authority(runner, profile_id=str(tmp_path), instance_id="test")
+    authority._schedule = lambda _ref: None
+    transport = SimpleNamespace(write=lambda _frame: None)
+    host = AuthorityConnection(authority, transport, {"user_id": "owner"})
+    response = await host.dispatch({"id": 1, "method": "a2a.forward", "params": dict(
+        agent="dev", tenant="team", peer="alice", context_id="ctx/a", input_id="first", text="hello")})
+    assert "result" in response, response
+    sid = response["result"]["session_id"]
+    for row in TRANSCRIPT:
+        authority.db.append_message(sid, row["role"], row["content"])
+    return SimpleNamespace(runner=runner, authority=authority, transport=transport, host=host,
+                           ref=SessionRef(str(tmp_path), sid), live=authority.sessions[sid])
+
+
+async def _settled(authority):
+    """The local refine's side thread, which runs its review fork inline, has unwound (``_spawn``'s ledger)."""
+    await async_wait_until(lambda: not getattr(authority, "_side_agents", None), timeout=30,
+                           what="the refine side thread and its review fork finishing")
+
+
+async def _close(a2a, *connections):
+    for connection in (a2a.host, *connections):
+        await connection.close()
+    a2a.authority.db.close()
+
+
+ALICE = {"id": "alice", "name": "alice", "is_bot": True}
+
+
+@pytest.mark.asyncio
+async def test_a_humans_session_command_refine_on_a_frozen_a2a_session_keeps_its_memory_writes(
+        tmp_path, monkeypatch, real_store):
+    """An authenticated human with ``session:control`` runs ``/refine`` through ``session.command`` on an A2A
+    session whose cached agent is gone: the local refine's real fork is not the peer, so its writes land."""
+    from gateway import session_tui_side
+    from gateway.session_a2a import forward_author
+    from gateway.session_commands import execute_command
+    from gateway.session_controls import AuthorityConnection
+    from gateway.session_policy import policy_for_source
+    from hermes_state_runtime import RuntimeStoreError
+    a2a = await _frozen_a2a_session(tmp_path, monkeypatch)
+    assert forward_author(policy_for_source(a2a.runner, a2a.live.source)) == ALICE  # the session's history
+    monkeypatch.setattr(session_tui_side, "_side_agent", lambda *_a, **_k: real_store.make_agent())
+    reader = AuthorityConnection(a2a.authority, a2a.transport, {"user_id": "owner", "capabilities": ["session:read"]})
+    human = AuthorityConnection(a2a.authority, a2a.transport, {"user_id": "owner"})
+    try:
+        with pytest.raises(RuntimeStoreError) as refused:  # the real capability check stays in the path
+            await execute_command(reader, a2a.ref, {"command": "refine"})
+        assert refused.value.reason == "permission_denied"
+        reply = await execute_command(human, a2a.ref, {"command": "refine keep the rollback"})
+        assert reply["type"] == "exec" and "Reviewing this conversation" in reply["output"], reply
+        await _settled(a2a.authority)
+    finally:
+        await _close(a2a, reader, human)
+    results = real_store.tool_results()
+    assert results["call-user-add"]["success"] is True, results
+    assert results["call-memory-remove"]["success"] is True and not results["call-memory-remove"].get("staged"), results
+    (agent,) = real_store.agents
+    assert (agent._memory_store._entries_for("memory"), agent._memory_store._entries_for("user")) == (
+        [], ["Owner approved the rollback"])
+    assert "Owner approved the rollback" in real_store.disk()["USER.md"]
+    assert real_store.pending() == []
+    # No producer stamped this command: legacy (None), not the peer, and nothing claims it is a proven human.
+    assert real_store.seen_authors[0] is None
+
+
+@pytest.mark.asyncio
+async def test_a_forwarded_rows_admitted_peer_still_refuses_the_refine_forks_writes(tmp_path, monkeypatch, real_store):
+    """The forwarded row's own author (the real ``row_turn_author`` over the real frozen policy and admitted row),
+    bound as ``execute_admission`` binds it while that row's ``/refine`` executes, is the peer: writes are refused."""
+    from gateway import session_tui_side
+    from gateway.session_ingress import row_turn_author
+    from gateway.session_policy import policy_for_source
+    from hermes_state_runtime import list_session_admissions
+    a2a = await _frozen_a2a_session(tmp_path, monkeypatch)
+    monkeypatch.setattr(session_tui_side, "_side_agent", lambda *_a, **_k: real_store.make_agent())
+    (row,) = list_session_admissions(a2a.authority.db, session_id=a2a.ref.session_id)
+    author = row_turn_author(policy_for_source(a2a.runner, a2a.live.source), row)
+    assert author == ALICE
+    try:
+        with _admitted(author):
+            await _refine(_event(a2a.live.source, focus=_CLAIMS_HUMAN, turn_author=dict(HUMAN)), a2a.runner)
+        await _settled(a2a.authority)
+    finally:
+        await _close(a2a)
+    results = real_store.tool_results()
+    assert set(results) == set(_FORK_CALLS)
+    for result in results.values():
+        assert result["success"] is False and not result.get("staged"), result
+        assert "nothing was written" in result["error"].lower(), result
+    (agent,) = real_store.agents
+    assert (agent._memory_store._entries_for("memory"), agent._memory_store._entries_for("user")) == ([SEED], [])
+    assert real_store.disk() == real_store.befores[0]
+    assert real_store.pending() == []
+    assert real_store.seen_authors[0] == ALICE

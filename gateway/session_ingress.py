@@ -274,26 +274,22 @@ def row_turn_author(policy, row):
     return forward_author(policy)
 
 
-def command_turn_author(runner, source):
+def command_turn_author(_runner, source):
     """Who issued the command executing now, for memory attribution only, as a private normalized copy.
-    Trusted inputs only: the admitted row's author ``execute_admission`` binds, the authenticated peer of a
-    forward session's frozen policy, and the native sender's own flags (as the turn runner reads them). A bot
-    among them wins, so no other label relabels a bot's command as a human's. Never the command text, the
-    transcript or the event's metadata; None for a local command no producer stamped (legacy)."""
+    The admitted row's author ``execute_admission`` binds (a forwarded row's is its peer, ``row_turn_author``)
+    is authoritative, a human one included, as the turn runner takes it; only without one do the native
+    sender's own flags apply. Never the session's forward policy: it names who wrote the forwarded turns, not
+    who issues a later control command. Never the command text, the transcript or the event's metadata;
+    None for a local command no producer stamped (legacy, not a proof of a human)."""
     from agent.turn_author import parse_turn_author
     from gateway.config import Platform
-    from gateway.session_a2a import forward_author
-    from gateway.session_policy import policy_for_source
-    try:
-        policy = policy_for_source(runner, source)
-    except RuntimeStoreError:  # its frozen policy is not restored yet: the command's own route answers that
-        policy = None
-    trusted = [admission_author.get(), forward_author(policy)]
-    if source is not None and (source.platform != Platform.LOCAL or getattr(source, 'is_bot', False)):
-        trusted.append({'id': source.user_id or None, 'name': source.user_name or None,
-                        'is_bot': bool(getattr(source, 'is_bot', False))})
-    authors = [author for author in map(parse_turn_author, trusted) if author is not None]
-    return next((author for author in authors if author['is_bot']), next(iter(authors), None))
+    admitted = parse_turn_author(admission_author.get())
+    if admitted is not None or source is None:
+        return admitted
+    if source.platform == Platform.LOCAL and not getattr(source, 'is_bot', False):
+        return None
+    return parse_turn_author({'id': source.user_id or None, 'name': source.user_name or None,
+                              'is_bot': bool(getattr(source, 'is_bot', False))})
 
 
 async def execute_admission(authority, ref, row):

@@ -61,6 +61,21 @@ def test_inline_bot_turn_write_reaches_neither_store_nor_mirror(tmp_path, monkey
     assert not (tmp_path / "memories" / "MEMORY.md").exists()
 
 
+# What the turn runner builds for a native sender with the bot flag and no user id or name (a Slack workflow post).
+IDLESS_BOT = {"id": None, "name": None, "is_bot": True}
+
+
+def test_inline_idless_bot_turn_write_reaches_neither_store_nor_mirror(tmp_path, monkeypatch):
+    agent, sink = _inline_agent(tmp_path, monkeypatch)
+    with _bound(dict(IDLESS_BOT)):
+        single = _inline_call(agent, action="add", target="user", content="Owner prefers rollbacks")
+        batch = _inline_call(agent, target="memory", operations=[{"action": "add", "content": "Bot fact"}])
+    assert single["success"] is False and batch["success"] is False
+    assert sink.writes == []
+    assert not (tmp_path / "memories" / "USER.md").exists()
+    assert not (tmp_path / "memories" / "MEMORY.md").exists()
+
+
 def test_tool_arguments_cannot_choose_the_author(tmp_path, monkeypatch):
     """Author-looking keys in the model's arguments are ignored in both directions."""
     agent, sink = _inline_agent(tmp_path, monkeypatch)
@@ -154,3 +169,24 @@ def test_live_turn_binds_its_author_only_for_its_own_duration(monkeypatch):
     assert current_turn_author() is None
     agent.run_conversation("remember that I approved the rollback")
     assert seen_authors == [BOT, BOT, None, None]
+
+
+def test_live_idless_bot_turn_cannot_write_and_next_human_turn_can(tmp_path, monkeypatch):
+    """The actual bound turn: ``run_conversation(turn_author=...)`` with the turn runner's ID-less bot shape."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    memories = tmp_path / "memories"
+    agent, _seen = _live_agent(monkeypatch, [dict(t) for t in _TURNS])
+
+    bot_turn = agent.run_conversation("workflow post", turn_author=dict(IDLESS_BOT))
+    (bot_result,) = _memory_results(bot_turn)
+    assert bot_result["success"] is False, bot_result
+    assert "nothing was written" in bot_result["error"].lower()
+    assert not (memories / "USER.md").exists()
+
+    human_turn = agent.run_conversation("remember that I approved the rollback",
+                                        turn_author={"id": "1234", "name": "Aldo", "is_bot": False})
+    (human_result,) = _memory_results(human_turn)
+    assert human_result["success"] is True, human_result
+    persisted = (memories / "USER.md").read_text(encoding="utf-8")
+    assert "Owner approved the rollback" in persisted
+    assert "Bot says" not in persisted

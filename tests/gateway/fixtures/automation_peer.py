@@ -110,7 +110,15 @@ async def probe(root, base, mode):
     try:
         async with websockets.serve(connector, '127.0.0.1', 0) as relay:
             url = f'http://127.0.0.1:{model.server_port}/v1'
+            # This probe pins durable FIFO ORDER: the human follower must be admitted as its own
+            # queued row behind the HELD turn, and the producer's row after it. The supported
+            # display.busy_input_mode 'queue' is what guarantees that; under the default 'interrupt'
+            # a TEXT follower may legitimately redirect the held turn instead
+            # (run_inbound._hm_busy_preempt -> run_busy._resolve_busy_steer_or_redirect) and get no
+            # row. So both modes opt into 'queue' explicitly. This probe does not cover
+            # default-interrupt busy behaviour; the gateway busy/redirect unit tests do.
             cfg = {'gateway': {'multiplex_profiles': False},
+                'display': {'busy_input_mode': 'queue'},
                 'model': {'provider': 'custom', 'default': 'local-fixture', 'base_url': url},
                 'streaming': {'enabled': False}, 'terminal': {'cwd': str(home)},
                 'approvals': {'mode': 'off'},

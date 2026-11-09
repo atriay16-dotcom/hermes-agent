@@ -890,11 +890,13 @@ class AIAgent(
         _notify_context_engine_session_end(self, messages)
 
     def _sync_external_memory_for_turn(self, *, original_user_message: Any, final_response: Any, interrupted: bool,
-                                       messages: list | None = None) -> None:
+                                       messages: list | None = None, turn_source: dict | None = None) -> None:
         """Mirror a completed turn into external memory providers (``sync_all`` + ``queue_prefetch_all``).
 
         Uses ``original_user_message`` (``user_message`` may carry injected skill content). Interrupted turns
         are skipped: partial output is not durable truth. Best-effort — an offline backend never blocks.
+        ``turn_source`` (the finalizer's ``{"turn_id", "marker"}`` for this invocation's admitted user row,
+        see ``agent.turn_context.stamp_memory_turn_source``) is forwarded to ``sync_all`` only when given.
 
         A partial assistant output, an aborted tool chain, or a mid-stream reset is not durable
         conversational truth — mirroring it into an external memory backend pollutes future recall with
@@ -915,6 +917,8 @@ class AIAgent(
             turn_author = getattr(self, "_turn_author", None)
             if turn_author is not None:
                 sync_kwargs["turn_author"] = turn_author
+            if turn_source is not None:
+                sync_kwargs["turn_source"] = turn_source
             self._memory_manager.sync_all(user_text, response_text, **sync_kwargs)
             # Sibling of the build_turn_context() prefetch gate: don't key recall on zero-signal prompts.
             if not is_trivial_prompt(user_text):

@@ -25,6 +25,27 @@ from tests.gateway.fixtures.local_recovery_probe import Model, child_env, daemon
 from tests.waiting import async_wait_until
 
 
+async def _until_idle(ws, sid):
+    """Wait for ``session.active_list`` to report ``sid`` idle.
+
+    ``settled()`` reads the durable admission rows, but until a settlement is published the
+    authority still reads its terminal row as the running claim, and a command issued then takes
+    the busy path (an ``exec`` reply, no ``message``).
+    """
+    reply = None
+    try:
+        async with asyncio.timeout(45):
+            while True:
+                reply = await rpc(ws, 'session.active_list')
+                assert 'result' in reply, ('session.active_list', reply)
+                rows = reply['result']['sessions']
+                if any(row['id'] == sid and row['status'] == 'idle' for row in rows):
+                    return
+                await asyncio.sleep(0)
+    except TimeoutError:
+        raise AssertionError(f'session.active_list never reported {sid} idle: {reply}') from None
+
+
 @pytest.mark.platforms("linux")  # the daemon is stopped with SIGINT, which raises on Windows
 def test_local_review_reviews_the_stored_conversation_once_the_cached_agent_is_gone(tmp_path):
     root = Path(__file__).resolve().parents[2]
@@ -88,7 +109,10 @@ def test_local_review_reviews_the_stored_conversation_once_the_cached_agent_is_g
             await rpc(ws, 'prompt.submit', session_id=sid, input_id='warm', text='OPENED_PR_42')
             await async_wait_until(settled, timeout=45, what='the warm turn settling')
             out['warm'] = await review(ws, sid, 'resident pass')
-            moa = (await rpc(ws, 'slash.exec', session_id=sid, command='moa compare the options'))['result']
+            await _until_idle(ws, sid)
+            reply = await rpc(ws, 'slash.exec', session_id=sid, command='moa compare the options')
+            moa = reply.get('result') or {}
+            assert moa.get('type') == 'send' and 'message' in moa, ('/moa returned no prompt', reply)
             await rpc(ws, 'prompt.submit', session_id=sid, input_id='moa', text=moa['message'])
             await async_wait_until(settled, timeout=45, what='the /moa turn settling')
             out['cold'] = await review(ws, sid, 'cold pass')
@@ -106,3 +130,27 @@ def test_local_review_reviews_the_stored_conversation_once_the_cached_agent_is_g
     assert out['cold']['saw_conversation'], out
     assert out['warm']['provider'] == {'only': ['session'], 'data_collection': 'deny'}, out
     assert out['cold'] == out['warm'], ('a cold /review must send what a resident one sends', out)
+
+
+class _ActiveListSocket:
+    """``session.active_list`` replies: another session idle while ours works, ours working, then idle."""
+
+    def __init__(self, sid):
+        self.sent = []
+        self.replies = [[{'id': 'other', 'status': 'idle'}, {'id': sid, 'status': 'working'}],
+                        [{'id': sid, 'status': 'working'}],
+                        [{'id': sid, 'status': 'idle'}]]
+
+    async def send(self, frame):
+        self.sent.append(json.loads(frame))
+
+    async def recv(self):
+        return json.dumps({'jsonrpc': '2.0', 'id': self.sent[-1]['id'],
+                           'result': {'sessions': self.replies[len(self.sent) - 1]}})
+
+
+def test_until_idle_returns_only_once_the_sessions_own_row_is_idle():
+    ws = _ActiveListSocket('sid-1')
+    asyncio.run(_until_idle(ws, 'sid-1'))
+    frame = {'jsonrpc': '2.0', 'id': 'session.active_list', 'method': 'session.active_list', 'params': {}}
+    assert ws.sent == [frame] * 3, ws.sent

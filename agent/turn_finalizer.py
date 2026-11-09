@@ -590,14 +590,18 @@ def public_pre_transform(agent, pre_transform: Optional[Any]) -> Optional[Any]:
 
 def _mirror_turn_to_memory(
     agent, *, original_user_message, final_response, interrupted, messages, review_memory, review_skills, vetoed,
+    turn_source=None,
 ) -> None:
     """External-memory sync (+ next prefetch), then the background memory/skill review. A prompt a
-    ``pre_llm_call`` hook vetoed never leaves the host, so neither runs for that turn."""
+    ``pre_llm_call`` hook vetoed never leaves the host, so neither runs for that turn. ``turn_source`` is
+    this invocation's own memory turn source (``turn_context.memory_turn_source_for``), forwarded only
+    when present."""
     if vetoed:
         return
     agent._sync_external_memory_for_turn(
         original_user_message=original_user_message, final_response=final_response,
         interrupted=interrupted, messages=messages,
+        **({"turn_source": turn_source} if turn_source is not None else {}),
     )
     # Background memory/skill review runs AFTER delivery so it never competes with the
     # user's task. Suppressed by skip_background_review (e.g. cron): the fork costs
@@ -624,9 +628,11 @@ def finalize_turn(
 ):
     """Run the post-loop finalization and return the turn ``result`` dict."""
     from agent.conversation_loop import logger
-    from agent.turn_context import PRE_LLM_BLOCK_EXIT_REASON
+    from agent.turn_context import PRE_LLM_BLOCK_EXIT_REASON, memory_turn_source_for
 
     vetoed = _turn_exit_reason == PRE_LLM_BLOCK_EXIT_REASON  # a pre_llm_call block: no model call at all
+    # Bound now to this invocation's local turn_id, never re-read from newer agent state at mirror time.
+    memory_turn_source = memory_turn_source_for(agent, turn_id)
 
     final_response, _turn_exit_reason, preserved_verification_fallback, interrupted = _resolve_budget_fallback(
         agent, final_response=final_response, api_call_count=api_call_count,
@@ -871,7 +877,7 @@ def finalize_turn(
     _mirror_turn_to_memory(
         agent, original_user_message=original_user_message, final_response=final_response,
         interrupted=interrupted, messages=messages, review_memory=_should_review_memory,
-        review_skills=_should_review_skills, vetoed=vetoed,
+        review_skills=_should_review_skills, vetoed=vetoed, turn_source=memory_turn_source,
     )
 
     # Opt-in (compression.prepare_ahead): near the trigger, write the next compaction summary

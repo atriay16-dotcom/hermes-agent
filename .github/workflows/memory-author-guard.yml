@@ -15,6 +15,11 @@ name: Memory author guard (fork validation)
 #                 standalone guards), the code-health ratchet against the literal reviewed
 #                 baseline, and the lefthook pre-commit ruff config on the Python files changed
 #                 since that baseline.
+#   honcho-pair   the external Honcho memory plugin, pinned to one literal commit of this
+#                 repository, run offline against this exact core by
+#                 scripts/ci/validate_honcho_pair.py: PM resolves its SDK as an explicit
+#                 member, every plugin test file runs once (network-marked cases deselected
+#                 and counted), plus a generated ID-less bot no-write control.
 # What does not run here (and is not claimed): tests/e2e, tests/integration and tests/docker
 # (run_tests.sh discovery excludes them), the macOS/Windows lanes of tests-os.yml (tests
 # carrying platforms("macos"/"windows") report as skipped on Linux), Docker, Nix, JS and Rust.
@@ -201,6 +206,85 @@ jobs:
           printf '%s\n' "${files[@]}"
           ruff --version
           ruff check --no-cache --config ./ruff.pre-commit.toml -- "${files[@]}"
+
+      - name: Check the checkout is clean
+        uses: ./.github/actions/check-clean-worktree
+
+  honcho-pair:
+    name: Paired Honcho plugin (offline suite vs this core)
+    if: github.repository == 'atriay16-dotcom/hermes-agent' && github.event_name == 'push' && github.ref == 'refs/heads/fix/honcho-agent-upgrade-20261108'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      # The reviewed plugin source, by literal commit and tree; never a branch tip or a release.
+      PLUGIN_COMMIT: 06664b491ab9a18edcf1dd48f68cf66e149483f8
+      PLUGIN_TREE: 8d39010ccfecbfd6e8973fbf669ff1868ec7cc73
+      PLUGIN_FILES: "64"
+      HONCHO_SDK_VERSION: 2.8.0
+      # tests/test_oauth_flow.py (module-wide allow_network) is deselected, not run.
+      PLUGIN_NETWORK_CASES: "18"
+    steps:
+      - name: Checkout the exact pushed commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Checkout the pinned plugin commit
+        # actions/checkout only writes under the workspace; the next step moves it out.
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: atriay16-dotcom/hermes-agent
+          ref: 06664b491ab9a18edcf1dd48f68cf66e149483f8 # = PLUGIN_COMMIT, verified next step
+          path: .honcho-plugin-checkout
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Move the plugin out of the core checkout and verify both identities
+        run: |
+          set -euo pipefail
+          mv "$GITHUB_WORKSPACE/.honcho-plugin-checkout" "$RUNNER_TEMP/honcho-plugin"
+          plugin="$RUNNER_TEMP/honcho-plugin"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test -z "$(git status --porcelain --untracked-files=all)"
+          test "$(git -C "$plugin" rev-parse HEAD)" = "$PLUGIN_COMMIT"
+          test "$(git -C "$plugin" rev-parse 'HEAD^{tree}')" = "$PLUGIN_TREE"
+          test "$(git -C "$plugin" ls-tree -r --name-only HEAD | wc -l)" = "$PLUGIN_FILES"
+          echo "core: $GITHUB_SHA"
+          echo "plugin: $PLUGIN_COMMIT tree $PLUGIN_TREE ($PLUGIN_FILES files)"
+
+      - name: Set up locked Python and test dependencies
+        # The tests job's dev+test environment (HERMES_PYTHON under $RUNNER_TEMP), caches off.
+        uses: ./.github/actions/setup-pm
+        with:
+          extras: '["all", "anthropic", "bedrock", "mistral", "fal", "modal", "daytona", "parallel-web", "keychain"]'
+          test-environment: 'true'
+          cache: 'false'
+          cache-python: 'false'
+
+      - name: Resolve the plugin's SDK through PM against this core
+        run: |
+          set -euo pipefail
+          case "$HERMES_PYTHON" in
+            "$RUNNER_TEMP"/*) ;;
+            *) echo "::error::HERMES_PYTHON is not under RUNNER_TEMP: $HERMES_PYTHON"; exit 1 ;;
+          esac
+          "$HERMES_PYTHON" -I scripts/ci/validate_honcho_pair.py prepare \
+            --core "$GITHUB_WORKSPACE" --plugin "$RUNNER_TEMP/honcho-plugin" \
+            --state "$RUNNER_TEMP/honcho-pair" --python "$HERMES_PYTHON" \
+            --expect-sdk "$HONCHO_SDK_VERSION"
+
+      - name: Run the plugin's offline suite and the ID-less bot control
+        # One pytest process per plugin test file, zero retries; any failure, error, count
+        # mismatch or failed control is the step's nonzero exit.
+        run: |
+          "$HERMES_PYTHON" -I scripts/ci/validate_honcho_pair.py test \
+            --core "$GITHUB_WORKSPACE" --plugin "$RUNNER_TEMP/honcho-plugin" \
+            --state "$RUNNER_TEMP/honcho-pair" --python "$HERMES_PYTHON" \
+            --expect-sdk "$HONCHO_SDK_VERSION" --expect-commit "$PLUGIN_COMMIT" \
+            --expect-tree "$PLUGIN_TREE" --expect-network "$PLUGIN_NETWORK_CASES" \
+            --expect-core-sha "$GITHUB_SHA"
 
       - name: Check the checkout is clean
         uses: ./.github/actions/check-clean-worktree
