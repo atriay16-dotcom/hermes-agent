@@ -390,3 +390,54 @@ def test_human_approval_replays_after_a_real_bot_authored_agent_turn(approval_on
     persisted = _disk(tmp_path)["USER.md"]
     assert "Owner approved the rollback" in persisted and "Bot says" not in persisted
     assert _pending() == []
+
+
+# ── A trusted producer's ID-less, name-less bot (a Slack workflow post) is a bot, not a legacy author ────────
+
+IDLESS_BOTS = [
+    pytest.param({"id": None, "name": None, "is_bot": True}, id="turn-runner-shape"),
+    pytest.param({"is_bot": True}, id="bare-flag"),
+    pytest.param({"id": "  ", "name": "\x00\t", "is_bot": "true"}, id="cleaned-empty-fields-string-flag"),
+]
+
+
+@pytest.mark.parametrize("author", IDLESS_BOTS)
+@pytest.mark.parametrize("target", ["memory", "user"])
+def test_idless_bot_turn_is_refused_before_the_store_and_keeps_the_inventory_read(store, tmp_path, author, target):
+    store.add(target, SEED)
+    before = _disk(tmp_path)
+    with _bound(author):
+        single = _call(store, action="add", target=target, content="Owner approved the rollback")
+        batch = _call(store, target=target, operations=[{"action": "add", "content": "Bot fact"},
+                                                        {"action": "remove", "old_text": "Seeded"}])
+        inventory = _call(store, action="remove", target=target)
+    _assert_refused(single)
+    _assert_refused(batch)
+    assert inventory["current_entries"] == [SEED]
+    assert _disk(tmp_path) == before
+    assert store._entries_for(target) == [SEED]
+    assert _pending() == []
+
+
+@pytest.mark.parametrize("author", [
+    pytest.param({"is_bot": False}, id="flag-false"),
+    pytest.param({"id": None, "name": None, "is_bot": "maybe"}, id="invalid-flag"),
+    pytest.param({"id": "", "name": " ", "is_bot": 0}, id="cleaned-empty-fields-zero-flag"),
+])
+def test_idless_author_without_a_true_bot_flag_stays_legacy_and_writes(store, tmp_path, author):
+    with _bound(author):
+        assert _call(store, action="add", target="user", content="Proceed")["success"] is True
+    assert "Proceed" in _disk(tmp_path)["USER.md"]
+
+
+def test_idless_bot_binding_resets_after_nesting_and_follows_its_worker(store, tmp_path):
+    import contextvars
+    with _bound(HUMAN):
+        with _bound({"is_bot": True}):
+            worker = contextvars.copy_context()
+            _assert_refused(_call(store, action="add", target="user", content="Inner bot fact"))
+        assert _call(store, action="add", target="user", content="Outer human fact")["success"] is True
+    # A tool worker copied from the bot's turn keeps that turn's author after the turn has moved on.
+    _assert_refused(worker.run(_call, store, action="add", target="user", content="Late bot fact"))
+    persisted = _disk(tmp_path)["USER.md"]
+    assert "Outer human fact" in persisted and "bot fact" not in persisted.lower()

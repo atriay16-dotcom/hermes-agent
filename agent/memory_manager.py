@@ -71,6 +71,13 @@ def _has_var_kwargs(params) -> bool:
     return any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
 
 
+def _declares_keyword(params, keyword: str) -> bool:
+    """Whether ``params`` explicitly names ``keyword`` as a parameter ``keyword=...`` binds to. A positional-only
+    or ``*keyword`` parameter cannot take it by name, and ``**keyword`` is a catch-all, which declares nothing."""
+    kind = getattr(params.get(keyword), "kind", None)
+    return kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+
+
 def _accepts_require_checkpoint(fn: Callable[..., Any]) -> bool:
     """True if ``fn`` can receive the ``require_checkpoint`` keyword (unreadable signatures -> False).
 
@@ -94,6 +101,30 @@ def _scrub(text: str) -> str:
 
 
 _TOKEN_RE = re.compile(r"[A-Za-z0-9_\-./+]{16,}")
+
+
+def _structural_snapshot(value: Any) -> Any:
+    """A structural copy of dict/list/plain-tuple containers at every depth (leaf values shared; strings
+    are immutable), so work queued for the background worker never observes a caller's later in-place
+    mutation of the list, a nested row or an author dict."""
+    if isinstance(value, dict):
+        return {k: _structural_snapshot(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_structural_snapshot(v) for v in value]
+    if type(value) is tuple:
+        return tuple(_structural_snapshot(v) for v in value)
+    return value
+
+
+def _primitive_turn_source(value: Any) -> Optional[dict[str, str]]:
+    """The optional memory turn source as a fresh ``{"turn_id", "marker"}`` of non-empty strings, or None
+    for anything else (never coerced: a malformed origin is no origin)."""
+    if not isinstance(value, dict):
+        return None
+    turn_id, marker = value.get("turn_id"), value.get("marker")
+    if not (isinstance(turn_id, str) and turn_id.strip() and isinstance(marker, str) and marker.strip()):
+        return None
+    return {"turn_id": turn_id, "marker": marker}
 
 
 def _redact_for_provider(*values: Any) -> Any:
@@ -450,24 +481,50 @@ class MemoryManager:
             providers=providers,
         ), kind="prefetch")
 
+    def accepts_turn_source(self) -> bool:
+        """Whether a registered provider's ``sync_turn`` explicitly declares the optional ``turn_source``
+        keyword (``_declares_keyword``), i.e. whether anything consumes the producer's memory turn source.
+        Read from signatures only (no availability probe, no I/O). A ``**kwargs``-only or uninspectable
+        ``sync_turn`` does not count, nor does a positional-only, ``*turn_source`` or ``**turn_source``
+        parameter: the producer stamps rows only for a declared reader, the same set dispatch forwards to.
+        A fork never syncs (``_fork_turn_hooks_suppressed``), so nothing there would read a source."""
+        if self._fork_turn_hooks_suppressed():
+            return False
+        for provider in list(self._providers):
+            params = _signature_params(getattr(provider, "sync_turn", None))
+            if params is not None and _declares_keyword(params, "turn_source"):
+                return True
+        return False
+
     @staticmethod
     def _provider_sync_accepts(provider: MemoryProvider, keyword: str) -> bool:
-        """Whether ``sync_turn`` accepts ``keyword`` (uninspectable → assume yes)."""
+        """Whether ``sync_turn`` accepts ``keyword`` (uninspectable → assume yes). ``turn_source`` alone is
+        sent only to a declared keyword (``accepts_turn_source``): a wrong-kind parameter would turn it into a
+        TypeError that loses the whole turn, and a catch-all never asked for it."""
         params = _signature_params(provider.sync_turn)
+        if keyword == "turn_source":
+            return params is not None and _declares_keyword(params, keyword)
         return params is None or _has_var_kwargs(params) or keyword in params
 
     def sync_all(self, user_content: str, assistant_content: str, *, session_id: str = "",
                  messages: Optional[list[dict[str, Any]]] = None,
-                 turn_author: Optional[dict[str, Any]] = None) -> None:
+                 turn_author: Optional[dict[str, Any]] = None,
+                 turn_source: Optional[dict[str, Any]] = None) -> None:
         """Sync a completed turn to all providers on the background worker.
 
         Never inline: a provider's ``sync_turn`` may block for minutes, which kept ``run_conversation``
         open after the user saw the response. The single worker also serializes writes (turn N before N+1).
-        ``turn_author`` reaches only providers whose ``sync_turn`` accepts it.
+        ``turn_author`` reaches only providers whose ``sync_turn`` accepts it. So does ``turn_source``: the
+        producer's optional ``{"turn_id", "marker"}`` origin of this invocation's admitted user row, also
+        found at ``display_metadata["memory_turn_source"]`` on that row while it survives (see
+        ``agent.turn_context.stamp_memory_turn_source``); anything but two non-empty strings is dropped.
 
         Everything forwarded is provider egress: turn strings AND the ``messages`` transcript slice
         (tool outputs included) go through ``_redact_for_provider`` so secrets are never archived
-        verbatim in a provider's store (#115104).
+        verbatim in a provider's store (#115104). The redacted transcript, author and source are then
+        snapshotted structurally HERE, before the worker is queued: the redactor hands unchanged
+        containers back as-is, and a caller mutating its list or nested rows later must not change
+        what a provider is handed.
         """
         if self._fork_turn_hooks_suppressed():
             return
@@ -477,7 +534,9 @@ class MemoryManager:
             return
         clean_user_content, assistant_content, redacted_messages = _redact_for_provider(
             clean_user_content, assistant_content, messages)
-        optional_kwargs = {"messages": redacted_messages, "turn_author": turn_author}
+        optional_kwargs = {"messages": _structural_snapshot(redacted_messages),
+                           "turn_author": _structural_snapshot(turn_author),
+                           "turn_source": _primitive_turn_source(turn_source)}
 
         def _sync(provider: MemoryProvider) -> None:
             kwargs: dict[str, Any] = {"session_id": session_id}

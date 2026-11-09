@@ -66,7 +66,9 @@ def local_origin() -> str:
 
 
 def parse_turn_author(raw: Any) -> Optional[dict[str, Any]]:
-    """Normalize a dict or JSON string into ``{"id", "name", "is_bot"}``; None for anything else or without id and name.
+    """Normalize a dict or JSON string into ``{"id", "name", "is_bot"}``; None for anything else, or for a non-bot
+    without id and name (unknown, legacy). A bot without either stays a bot with no id: its producer knows that
+    much (a Slack workflow post carries neither), and no identity is made up for it.
     The id is whatever the transport knows the sender by: ``bot:<profile>`` on a bot-mode delivery inside one
     install, ``bot:<connection>/<profile>`` when the Desktop relayed it from another machine,
     ``bot:<hostname>/<profile>`` on a peer dm, the platform user id elsewhere.
@@ -81,7 +83,7 @@ def parse_turn_author(raw: Any) -> Optional[dict[str, Any]]:
             "name": _clean_text(raw.get("name")),
             "is_bot": _bot_flag(raw.get("is_bot")),
         }
-        if author["id"] is None and author["name"] is None:
+        if author["id"] is None and author["name"] is None and not author["is_bot"]:
             return None
         # Runtime-written chain fields of a bot-to-bot delivery (agent/bot_chain.py); never model input.
         hops = raw.get("hops")
