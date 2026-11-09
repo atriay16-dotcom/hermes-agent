@@ -11,7 +11,7 @@ plugin's own tests/pyproject.toml pins an old upstream hermes-agent, so it is no
            checked to match the PM environment's.
   test     Each plugin test file runs in its own pytest process from a scrubbed environment,
            core first on sys.path, zero retries. Network-marked cases are deselected and
-           counted. A generated control proves that an ID-less bot turn writes nothing
+           counted; any other skipped case is not executed and fails. A generated control proves that an ID-less bot turn writes nothing
            through the real provider, the real session manager, and core's own loader and
            MemoryManager, against a fake SDK, while human and legacy turns still write.
 
@@ -355,9 +355,11 @@ def _run_file(args, record, tests, test_file, network_ids, all_ids) -> dict:
     all_network = bool(in_file) and not expected
     ok = (rc == 0 or (rc == 5 and all_network)) and len(cases) == len(expected)
     bad = [f"{c}::{n} {o}" for c, n, o in cases if o in ("error", "failure")]
-    result = {"file": test_file, "exit": rc, "ok": ok and not bad, "cases": len(cases),
-              "expected": len(expected), "network_deselected": len(in_file) - len(expected),
-              "failed": bad}
+    skipped = [f"{c}::{n}" for c, n, o in cases if o == "skipped"]
+    result = {"file": test_file, "exit": rc, "ok": ok and not bad and not skipped,
+              "cases": len(cases), "expected": len(expected),
+              "network_deselected": len(in_file) - len(expected), "failed": bad,
+              "skipped": skipped}
     if not result["ok"]:
         result["tail"] = out[-6000:]
     return result | {"_cases": cases}
@@ -401,7 +403,9 @@ def _suite(args, record, tests: Path) -> dict:
     network_ids = set(_collect(args, record, tests, NETWORK_MARK))
     files = sorted({i.split("::")[0] for i in all_ids})
     results = [_run_file(args, record, tests, f, network_ids, all_ids) for f in files]
-    cases = [(r["file"], c, n) for r in results for c, n, _o in r.pop("_cases")]
+    # A skipped testcase was reported but not executed (and already failed its file).
+    cases = [(r["file"], c, n) for r in results for c, n, o in r.pop("_cases")
+             if o != "skipped"]
     return {"collected": len(all_ids), "unique_collected": len(set(all_ids)),
             "network_deselected": len(network_ids), "network_ids": sorted(network_ids),
             "files": len(files), "executed": len(cases), "unique_executed": len(set(cases)),
@@ -411,7 +415,8 @@ def _suite(args, record, tests: Path) -> dict:
 def _tally(suite: dict) -> dict:
     failed = [f for r in suite["file_results"] for f in r["failed"]]
     bad_files = [r["file"] for r in suite["file_results"] if not r["ok"]]
-    return {"failed_or_error": failed, "bad_files": bad_files}
+    skipped = [s for r in suite["file_results"] for s in r["skipped"]]
+    return {"failed_or_error": failed, "bad_files": bad_files, "skipped": skipped}
 
 
 def cmd_test(args) -> int:
@@ -439,6 +444,9 @@ def _problems(args, summary: dict) -> list[str]:
                         f"!= expected {args.expect_network}")
     if suite["unique_executed"] != suite["executed"]:
         problems.append("duplicate testcase ids in JUnit results")
+    if suite["skipped"]:
+        problems.append(f"{len(suite['skipped'])} non-network testcase(s) skipped, not "
+                        f"executed: {suite['skipped']}")
     if suite["executed"] != suite["collected"] - suite["network_deselected"]:
         problems.append(f"executed {suite['executed']} != collected "
                         f"{suite['collected']} - network {suite['network_deselected']}")
@@ -457,13 +465,15 @@ def _report(args, summary: dict) -> None:
         f"({summary['plugin']['files']} files), honcho-ai {summary['sdk']}",
         f"collected {suite['collected']} in {suite['files']} files; network deselected "
         f"{suite['network_deselected']}; executed {suite['executed']} "
-        f"(unique {suite['unique_executed']}); failed/error {len(suite['failed_or_error'])}",
+        f"(unique {suite['unique_executed']}); failed/error {len(suite['failed_or_error'])}; "
+        f"skipped {len(suite['skipped'])}",
         f"ID-less bot control: {'ok' if summary['idless_bot_control']['ok'] else 'FAILED'} "
         f"{summary['idless_bot_control']['passed']}",
     ]
     for result in suite["file_results"]:
         if not result["ok"]:
-            lines.append(f"FAILED {result['file']} exit={result['exit']} {result['failed']}")
+            lines.append(f"FAILED {result['file']} exit={result['exit']} {result['failed']}"
+                         f" skipped={result['skipped']}")
             print(result.get("tail", ""))
     lines += [f"PROBLEM {p}" for p in summary["problems"]]
     print("\n".join(f"=== Paired Honcho: {ln}" for ln in lines))
