@@ -24,7 +24,7 @@ from agent.skill_commands import extract_user_instruction_from_skill_message
 from agent.turn_author import a2a_key
 from .attribution import HONCHO_APP_URL, attribution_url
 from .clarification_capture import OBSERVATION_KIND, observation_records
-from .client import HonchoClientConfig, resolve_config_path
+from .client import HonchoClientConfig, resolve_active_host, resolve_config_path
 from .client import _host_block, _HostLookup
 from .client import join_plugin_threads, spawn_context_thread
 from .dialectic import DialecticMixin
@@ -202,7 +202,7 @@ class HonchoMemoryProvider(DialecticMixin, MemoryProvider):
         self._turn_count = 0
         # Author of the turn in flight, refreshed by on_turn_start.
         self._turn_author: dict[str, Any] = {}
-        # (config path, mtime_ns, size) -> identity_signature() values.
+        # (config path, host, content sha256) -> identity_signature() values; at most one entry.
         self._identity_signature_memo: dict[tuple, dict[str, Any]] = {}
         # Injection audit. Off unless the logging key enables it: the record holds the user's representation.
         self._injection_log_path: Optional[str] = None
@@ -821,22 +821,31 @@ class HonchoMemoryProvider(DialecticMixin, MemoryProvider):
     # Shared with the core prefetch gate so the two classifiers can never drift apart.
     _is_trivial_prompt = staticmethod(is_trivial_prompt)
 
+    @staticmethod
+    def _config_bytes(path) -> bytes | None:
+        try:
+            return path.read_bytes()
+        except OSError:
+            return None
+
     def identity_signature(self) -> Dict[str, Any]:
         """Identity-mapping values from honcho.json that bust a cached gateway agent when they change.
 
-        Memoized on the file's mtime and size, so the per-message call is one stat. ``{}`` when the
-        config cannot be read."""
+        Memoized on every input: the config path, the active host (the gateway shares one provider
+        instance across profiles) and a digest of the file's bytes. The stat is not enough, because
+        Linux stamps mtime from a coarse clock and two same-length rewrites inside one tick keep
+        ``(st_mtime_ns, st_size)``. The parse re-reads the file, so the result is memoized only when
+        the bytes are unchanged afterwards and the parsed JSON equals the hashed snapshot. The digest
+        stays in the memo and is never logged or returned. ``{}`` when the config cannot be read."""
         try:
             path = resolve_config_path()
-            try:
-                stat = path.stat()
-                memo_key = (str(path), stat.st_mtime_ns, stat.st_size)
-            except OSError:
-                memo_key = (str(path), None, None)
+            snapshot = self._config_bytes(path)
+            host = resolve_active_host()
+            memo_key = (str(path), host, None if snapshot is None else hashlib.sha256(snapshot).digest())
             cached = self._identity_signature_memo.get(memo_key)
             if cached is not None:
                 return dict(cached)
-            cfg = HonchoClientConfig.from_global_config(config_path=path)
+            cfg = HonchoClientConfig.from_global_config(host=host, config_path=path)
             aliases = cfg.user_peer_aliases if isinstance(cfg.user_peer_aliases, dict) else {}
             values = {
                 "workspace": cfg.workspace_id,
@@ -848,7 +857,12 @@ class HonchoMemoryProvider(DialecticMixin, MemoryProvider):
                 "session_prefixing": [bool(cfg.session_peer_prefix), bool(cfg.session_ai_peer_prefix)],
                 "a2a_sessions": bool(cfg.a2a_sessions),
             }
-            self._identity_signature_memo = {memo_key: values}
+            try:
+                expected_raw = None if snapshot is None else json.loads(snapshot.decode("utf-8-sig"))
+            except ValueError:
+                expected_raw = None  # malformed: the parse fell back to env, which the byte check covers
+            if self._config_bytes(path) == snapshot and (not isinstance(expected_raw, dict) or cfg.raw == expected_raw):
+                self._identity_signature_memo = {memo_key: values}
             return dict(values)
         except Exception:
             return {}

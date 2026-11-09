@@ -607,3 +607,204 @@ class TestProfilePeerUniqueness:
             "Profiles pinned to distinct peer names must not collapse to "
             "the same Honcho peer — otherwise profile isolation is fictional."
         )
+
+
+class TestIdentitySignatureMetadataCollision:
+    """``identity_signature()`` follows honcho.json's content, not just its stat.
+
+    Linux stamps mtime from a coarse clock (one tick, ~1 ms at HZ=1000), so two rewrites inside one
+    tick keep ``(st_mtime_ns, st_size)`` whenever the payloads are the same length, as "old" and
+    "new" are. These tests pin the stat with ``os.utime`` instead of relying on timing, so the
+    collision is deterministic. The gateway holds one provider instance for the whole process, so
+    host and profile contexts that share it must not share a memo entry either.
+    """
+
+    _BASE = {"apiKey": "k", "peerName": "Igor", "aiPeer": "hermes"}
+
+    @staticmethod
+    def _stat_key(path):
+        st = path.stat()
+        return st.st_mtime_ns, st.st_size
+
+    @staticmethod
+    def _pin_mtime(path, mtime_ns):
+        import os
+
+        os.utime(path, ns=(mtime_ns, mtime_ns))
+
+    @staticmethod
+    def _provider(home, monkeypatch):
+        from hermes_plugin_honcho import HonchoMemoryProvider
+
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        return HonchoMemoryProvider()
+
+    def _workspace_cfg(self, workspace, **extra):
+        return json.dumps({**self._BASE, **extra, "hosts": {"hermes": {"workspace": workspace}}})
+
+    def test_same_size_rewrite_with_identical_stat_returns_fresh_workspace(self, tmp_path, monkeypatch):
+        cfg_path = tmp_path / "honcho.json"
+        provider = self._provider(tmp_path, monkeypatch)
+        cfg_path.write_text(self._workspace_cfg("old"))
+        before = self._stat_key(cfg_path)
+        assert provider.identity_signature()["workspace"] == "old"
+
+        cfg_path.write_text(self._workspace_cfg("new"))
+        self._pin_mtime(cfg_path, before[0])
+        assert self._stat_key(cfg_path) == before, "precondition: the rewrite must collide on (mtime_ns, size)"
+
+        assert provider.identity_signature()["workspace"] == "new"
+
+    def test_same_path_replacement_with_identical_stat_returns_fresh_workspace(self, tmp_path, monkeypatch):
+        import os
+
+        cfg_path = tmp_path / "honcho.json"
+        provider = self._provider(tmp_path, monkeypatch)
+        cfg_path.write_text(self._workspace_cfg("old"))
+        before = self._stat_key(cfg_path)
+        assert provider.identity_signature()["workspace"] == "old"
+
+        staged = tmp_path / "honcho.json.staged"
+        staged.write_text(self._workspace_cfg("new"))
+        self._pin_mtime(staged, before[0])
+        os.replace(staged, cfg_path)
+        assert self._stat_key(cfg_path) == before, "precondition: the replacement must collide on (mtime_ns, size)"
+
+        assert provider.identity_signature()["workspace"] == "new"
+
+    def test_unchanged_content_returns_an_equal_signature_without_reparsing(self, tmp_path, monkeypatch):
+        cfg_path = tmp_path / "honcho.json"
+        provider = self._provider(tmp_path, monkeypatch)
+        parses = []
+        original = HonchoClientConfig.from_global_config
+
+        def counting(cls, *args, **kwargs):
+            parses.append(1)
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(HonchoClientConfig, "from_global_config", classmethod(counting))
+        cfg_path.write_text(self._workspace_cfg("same"))
+        first = provider.identity_signature()
+        assert provider.identity_signature() == first
+        assert provider.identity_signature() == first
+        assert len(parses) == 1, "an unchanged file must be served from the memo"
+
+        before = self._stat_key(cfg_path)
+        cfg_path.write_text(self._workspace_cfg("same"))
+        self._pin_mtime(cfg_path, before[0] + 1_000_000_000)
+        assert provider.identity_signature() == first
+
+        for workspace in ("w1", "w2", "w3"):
+            cfg_path.write_text(self._workspace_cfg(workspace))
+            self._pin_mtime(cfg_path, before[0])
+            assert provider.identity_signature()["workspace"] == workspace
+        assert len(provider._identity_signature_memo) <= 1, "the memo must stay bounded to one entry"
+
+    def test_host_contexts_sharing_one_file_stay_isolated(self, tmp_path, monkeypatch):
+        cfg_path = tmp_path / "honcho.json"
+        provider = self._provider(tmp_path, monkeypatch)
+        cfg_path.write_text(json.dumps({**self._BASE, "hosts": {"hermes_a": {"workspace": "ws-a"},
+                                                                "hermes_b": {"workspace": "ws-b"}}}))
+        seen = []
+        for host in ("hermes_a", "hermes_b", "hermes_a"):
+            monkeypatch.setenv("HERMES_HONCHO_HOST", host)
+            seen.append(provider.identity_signature()["workspace"])
+
+        assert seen == ["ws-a", "ws-b", "ws-a"]
+
+    def test_profiles_with_identical_stat_stay_isolated(self, tmp_path, monkeypatch):
+        homes = [tmp_path / "alpha", tmp_path / "bravo"]
+        for home in homes:
+            home.mkdir()
+            (home / "honcho.json").write_text(self._workspace_cfg(home.name))
+        pinned = self._stat_key(homes[0] / "honcho.json")[0]
+        for home in homes:
+            self._pin_mtime(home / "honcho.json", pinned)
+        assert self._stat_key(homes[0] / "honcho.json") == self._stat_key(homes[1] / "honcho.json")
+
+        provider = self._provider(homes[0], monkeypatch)
+        seen = []
+        for home in (homes[0], homes[1], homes[0]):
+            monkeypatch.setenv("HERMES_HOME", str(home))
+            seen.append(provider.identity_signature()["workspace"])
+
+        assert seen == ["alpha", "bravo", "alpha"]
+
+    def test_missing_and_malformed_fall_back_then_a_valid_rewrite_with_identical_stat_is_seen(
+            self, tmp_path, monkeypatch, caplog):
+        import logging
+
+        cfg_path = tmp_path / "honcho.json"
+        provider = self._provider(tmp_path, monkeypatch)
+        missing = provider.identity_signature()
+        assert missing and missing["workspace"] == "hermes", "a missing file keeps the env fallback, not {}"
+
+        valid = self._workspace_cfg("new")
+        cfg_path.write_text(valid[:-1] + "!")
+        before = self._stat_key(cfg_path)
+        with caplog.at_level(logging.WARNING):
+            malformed = provider.identity_signature()
+            assert provider.identity_signature() == malformed
+        assert malformed == missing, "unparseable JSON falls back to env exactly like a missing file"
+        assert sum("Failed to read" in r.getMessage() for r in caplog.records) == 1, (
+            "an unchanged malformed file must not re-warn on every message")
+
+        cfg_path.write_text(valid)
+        self._pin_mtime(cfg_path, before[0])
+        assert self._stat_key(cfg_path) == before, "precondition: the fix must collide on (mtime_ns, size)"
+
+        assert provider.identity_signature()["workspace"] == "new"
+
+    def _race_parse(self, monkeypatch, cfg_path, pinned, *, restore):
+        """Rewrite the file to "new" between the hashed snapshot and the parse, once; with ``restore``
+        put the "old" bytes back before returning, so the bytes read after the parse match again."""
+        original, raced = HonchoClientConfig.from_global_config, []
+
+        def racing(cls, *args, **kwargs):
+            if raced:
+                return original(*args, **kwargs)
+            raced.append(1)
+            cfg_path.write_text(self._workspace_cfg("new"))
+            self._pin_mtime(cfg_path, pinned)
+            cfg = original(*args, **kwargs)
+            if restore:
+                cfg_path.write_text(self._workspace_cfg("old"))
+                self._pin_mtime(cfg_path, pinned)
+            return cfg
+
+        monkeypatch.setattr(HonchoClientConfig, "from_global_config", classmethod(racing))
+
+    @pytest.mark.parametrize("restore", [False, True], ids=["write-lands", "write-reverted"])
+    def test_a_write_racing_the_parse_is_not_memoized_under_the_hashed_bytes(self, tmp_path, monkeypatch, restore):
+        cfg_path = tmp_path / "honcho.json"
+        provider = self._provider(tmp_path, monkeypatch)
+        cfg_path.write_text(self._workspace_cfg("old"))
+        pinned = cfg_path.stat().st_mtime_ns
+        self._race_parse(monkeypatch, cfg_path, pinned, restore=restore)
+
+        assert provider.identity_signature()["workspace"] == "new", "the parse saw the racing write"
+        cfg_path.write_text(self._workspace_cfg("old"))
+        self._pin_mtime(cfg_path, pinned)
+
+        assert provider.identity_signature()["workspace"] == "old"
+
+    def test_signature_and_logs_carry_no_secret_or_content_fingerprint(self, tmp_path, monkeypatch, caplog):
+        import logging
+
+        secret = "sk-honcho-SENTINEL-0123456789abcdef"
+        cfg_path = tmp_path / "honcho.json"
+        provider = self._provider(tmp_path, monkeypatch)
+        caplog.set_level(logging.DEBUG)
+        signatures, digests, pinned = [], [], None
+        for workspace in ("old", "new"):
+            cfg_path.write_text(self._workspace_cfg(workspace, apiKey=secret))
+            pinned = pinned if pinned is not None else cfg_path.stat().st_mtime_ns
+            self._pin_mtime(cfg_path, pinned)
+            content = cfg_path.read_bytes()
+            digests += [hashlib.sha256(content).hexdigest(), hashlib.blake2b(content).hexdigest()]
+            signatures.append(provider.identity_signature())
+
+        exposed = repr(signatures) + caplog.text
+        assert secret not in exposed
+        assert not any(d[:16] in exposed for d in digests)
+        assert [s["workspace"] for s in signatures] == ["old", "new"]
