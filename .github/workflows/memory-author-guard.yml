@@ -24,7 +24,7 @@ name: Memory author guard (fork validation)
 # (run_tests.sh discovery excludes them), the macOS/Windows lanes of tests-os.yml (tests
 # carrying platforms("macos"/"windows") report as skipped on Linux), Docker, Nix, JS and Rust.
 #
-# Inert outside the owner fork: the push filter names a single branch, and every job also
+# Inert outside the owner fork: the push filter names two exact branches, and every job also
 # checks the repository and the ref. No pull_request, tag, release, schedule, workflow_run or
 # workflow_dispatch trigger (a dispatch is unavailable anyway while the fork's default branch
 # lacks this file); repeat a run with a re-push or `gh run rerun`.
@@ -33,6 +33,9 @@ on:
   push:
     branches:
       - fix/honcho-agent-upgrade-20261108
+      # The one-time exact-pair cutover executor (scripts/ops/honcho_exact_pair*.py) on top of the
+      # frozen core a61e8dc5; same jobs, pins and accounting. It is never the installed payload.
+      - ops/honcho-exact-pair-executor-20261109
 
 permissions:
   contents: read
@@ -44,7 +47,7 @@ concurrency:
 jobs:
   tests:
     name: Python tests (${{ matrix.slice }}/4)
-    if: github.repository == 'atriay16-dotcom/hermes-agent' && github.event_name == 'push' && github.ref == 'refs/heads/fix/honcho-agent-upgrade-20261108'
+    if: github.repository == 'atriay16-dotcom/hermes-agent' && github.event_name == 'push' && (github.ref == 'refs/heads/fix/honcho-agent-upgrade-20261108' || github.ref == 'refs/heads/ops/honcho-exact-pair-executor-20261109')
     runs-on: ubuntu-24.04
     # tests.yml packs ~10 min of work onto 32 cores per three slices; one quarter of it on 4
     # vCPUs is expected to take roughly 25-45 min. Split further rather than raise this.
@@ -145,7 +148,7 @@ jobs:
 
   source-gates:
     name: Source gates vs reviewed baseline
-    if: github.repository == 'atriay16-dotcom/hermes-agent' && github.event_name == 'push' && github.ref == 'refs/heads/fix/honcho-agent-upgrade-20261108'
+    if: github.repository == 'atriay16-dotcom/hermes-agent' && github.event_name == 'push' && (github.ref == 'refs/heads/fix/honcho-agent-upgrade-20261108' || github.ref == 'refs/heads/ops/honcho-exact-pair-executor-20261109')
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     env:
@@ -212,7 +215,7 @@ jobs:
 
   honcho-pair:
     name: Paired Honcho plugin (offline suite vs this core)
-    if: github.repository == 'atriay16-dotcom/hermes-agent' && github.event_name == 'push' && github.ref == 'refs/heads/fix/honcho-agent-upgrade-20261108'
+    if: github.repository == 'atriay16-dotcom/hermes-agent' && github.event_name == 'push' && (github.ref == 'refs/heads/fix/honcho-agent-upgrade-20261108' || github.ref == 'refs/heads/ops/honcho-exact-pair-executor-20261109')
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     env:
